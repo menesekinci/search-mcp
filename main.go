@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"os"
+	"strings"
 	"time"
 
 	"github.com/menesekinci/search-mcp/internal/google"
@@ -15,6 +16,8 @@ import (
 )
 
 // ─── Configuration ──────────────────────────────────────────────
+
+const Version = "v0.5.2"
 
 var searchLevel = map[string]int{
 	"low": 3, "medium": 6, "high": 12, "crazy": 24,
@@ -79,13 +82,13 @@ type logFn func(format string, v ...any)
 func main() {
 	// Setup wizard mode
 	if len(os.Args) > 1 && os.Args[1] == "setup" {
-		setup.Run()
+		setup.RunWithVersion(Version)
 		return
 	}
 
 	// Version flag
 	if len(os.Args) > 1 && (os.Args[1] == "--version" || os.Args[1] == "-v") {
-		fmt.Println("search-mcp v0.5.1")
+		fmt.Println("search-mcp " + Version)
 		return
 	}
 
@@ -108,9 +111,9 @@ func main() {
 
 	server := mcp.NewServer(tools, func(name string, args map[string]any) (string, error) {
 		return app.handle(name, args)
-	})
+	}, Version)
 
-	fmt.Fprintf(os.Stderr, "search-mcp v0.5.1 ready\n")
+	fmt.Fprintf(os.Stderr, "search-mcp %s ready\n", Version)
 
 	if err := server.Run(); err != nil {
 		logf("fatal: %v", err)
@@ -161,12 +164,15 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 	forceFresh := intArg(args, "max_age_days", -1, -1, 365) == 0
 	fetchCount := searchLevel[level]
 
-	results, fromCache, err := a.doSearch(query, site, fetchCount, forceFresh, "main")
+	t := a.tc.NewThread("main")
+	defer a.closeThread(t)
+
+	results, fromCache, err := a.doSearch(query, site, fetchCount, forceFresh, t)
 	if err != nil {
 		return "", err
 	}
 
-	pages := a.fetchPages(results, fetchCount, maxPageCharsSingle, "main")
+	pages := a.fetchPages(t, results, fetchCount, maxPageCharsSingle)
 
 	return jsonString(map[string]any{
 		"query":         query,
@@ -206,9 +212,10 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 			})
 		case map[string]any:
 			specs = append(specs, querySpec{
-				Query: fmt.Sprint(v["query"]), Site: fmt.Sprint(v["site"]),
-				Level: orDefault(fmt.Sprint(v["level"]), defaultLevel),
-				ID:    orDefault(fmt.Sprint(v["id"]), fmt.Sprintf("t%d", i)),
+				Query:      orDefault(fmt.Sprint(v["query"]), ""),
+				Site:       orDefault(fmt.Sprint(v["site"]), ""),
+				Level:      orDefault(fmt.Sprint(v["level"]), defaultLevel),
+				ID:         orDefault(fmt.Sprint(v["id"]), fmt.Sprintf("t%d", i)),
 				ForceFresh: globalForce || intArg(v, "max_age_days", -1, -1, 365) == 0,
 			})
 		}
@@ -227,35 +234,40 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		Error        string           `json:"error,omitempty"`
 	}
 
-	ch := make(chan threadResult, len(specs))
+	var all []threadResult
 
 	for _, spec := range specs {
-		go func(s querySpec) {
-			r := threadResult{ID: s.ID, Query: s.Query, Level: s.Level}
-			fetchCount := searchLevel[s.Level]
+		r := threadResult{ID: spec.ID, Query: spec.Query, Level: spec.Level}
+		func() {
+			defer func() {
+				if rec := recover(); rec != nil {
+					r.Error = fmt.Sprintf("panic: %v", rec)
+					a.log("parallel: panic in thread %s: %v", spec.ID, rec)
+				}
+			}()
+
+			fetchCount := searchLevel[spec.Level]
 			if fetchCount == 0 {
 				fetchCount = searchLevel["medium"]
 			}
 
-			results, fromCache, err := a.doSearch(s.Query, s.Site, fetchCount, s.ForceFresh, s.ID)
+			t := a.tc.NewThread(spec.ID)
+			defer a.closeThread(t)
+
+			results, fromCache, err := a.doSearch(spec.Query, spec.Site, fetchCount, spec.ForceFresh, t)
 			if err != nil {
 				r.Error = err.Error()
-				ch <- r
 				return
 			}
 			r.Results = results
 			r.FromCache = fromCache
 
-			pages := a.fetchPages(results, fetchCount, maxPageCharsParallel, s.ID)
+			pages := a.fetchPages(t, results, fetchCount, maxPageCharsParallel)
 			r.Pages = pages
 			r.PagesFetched = len(pages)
-			ch <- r
-		}(spec)
-	}
+		}()
 
-	var all []threadResult
-	for range specs {
-		all = append(all, <-ch)
+		all = append(all, r)
 	}
 
 	success, cached, totalPages := 0, 0, 0
@@ -278,20 +290,19 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 
 // ─── shared: search (cache → live, with pagination) ────────────
 
-func (a *app) doSearch(query, site string, num int, forceFresh bool, threadName string) ([]google.Result, bool, error) {
+func (a *app) doSearch(query, site string, num int, forceFresh bool, t *kimi.Thread) ([]google.Result, bool, error) {
 	if !forceFresh {
 		if cached, err := a.db.GetSearch(query, site); err == nil && cached != nil {
 			if len(cached.Results) > num {
 				cached.Results = cached.Results[:num]
 			}
-			a.log("cache HIT [%s]: %q (%d results)", threadName, query, len(cached.Results))
+			a.log("cache HIT [%s]: %q (%d results)", t.Name(), query, len(cached.Results))
 			return cached.Results, true, nil
 		}
 	}
 
-	a.log("search [%s]: %q (target: %d)", threadName, query, num)
+	a.log("search [%s]: %q (target: %d)", t.Name(), query, num)
 
-	t := a.tc.NewThread(threadName)
 	var allResults []google.Result
 	seen := make(map[string]bool)
 	start := 0
@@ -355,60 +366,81 @@ func (a *app) doSearch(query, site string, num int, forceFresh bool, threadName 
 
 // ─── shared: auto-fetch pages ───────────────────────────────────
 
-func (a *app) fetchPages(results []google.Result, fetchCount int, maxChars int, threadName string) []map[string]any {
-	toFetch := fetchCount
-	if len(results) < toFetch {
-		toFetch = len(results)
-	}
-	if toFetch == 0 {
+// fetchPages auto-fetches the top N search results as markdown.
+// Broken pages (navigate/HTML/parse failure, or error-page content like
+// DNS NXDOMAIN / Cloudflare challenges) are skipped and the next result
+// is tried, up to `fetchCount` total successes. If no pages can be
+// fetched, the function returns nil.
+func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int, maxChars int) []map[string]any {
+	if len(results) == 0 {
 		return nil
 	}
 
-	a.log("auto-fetch: %d pages [%s]", toFetch, threadName)
-	t := a.tc.NewThread(threadName)
-	pages := make([]map[string]any, 0, toFetch)
+	a.log("auto-fetch: up to %d pages [%s]", fetchCount, t.Name())
+	pages := make([]map[string]any, 0, fetchCount)
 
-	for i := 0; i < toFetch; i++ {
+	for i := 0; i < len(results) && len(pages) < fetchCount; i++ {
 		url := results[i].URL
-		page := map[string]any{"url": url}
-
-		// Cache hit
-		if cached, err := a.db.GetPage(url); err == nil && cached != nil {
-			page["title"] = cached.Title
-			page["markdown"] = truncateStr(cached.Markdown, maxChars)
-			page["from_cache"] = true
-			pages = append(pages, page)
+		page := a.fetchOnePage(t, url, maxChars)
+		if page == nil {
+			// Broken or error page — skip and try the next result.
+			a.log("  skip: %s", truncateStr(url, 60))
 			continue
 		}
-
-		// Live fetch
-		if err := t.Navigate(url); err != nil {
-			page["title"] = "(navigate failed)"
-			pages = append(pages, page)
-			continue
-		}
-		html, err := t.GetHTML()
-		if err != nil {
-			page["title"] = "(HTML failed)"
-			pages = append(pages, page)
-			continue
-		}
-		content, err := parser.Extract(html, url)
-		if err != nil {
-			page["title"] = "(parse failed)"
-			pages = append(pages, page)
-			continue
-		}
-
-		// Store full markdown, return truncated
-		a.db.PutPage(url, content.Title, content.Byline, content.Markdown)
-
-		page["title"] = content.Title
-		page["markdown"] = truncateStr(content.Markdown, maxChars)
-		page["from_cache"] = false
 		pages = append(pages, page)
 	}
 	return pages
+}
+
+// fetchOnePage returns a populated page map, or nil if the page could
+// not be fetched or is an error page.
+func (a *app) fetchOnePage(t *kimi.Thread, url string, maxChars int) map[string]any {
+	page := map[string]any{"url": url}
+
+	// Cache hit
+	if cached, err := a.db.GetPage(url); err == nil && cached != nil {
+		if isErrorPage(cached.Markdown) {
+			// Cached entry is an error page — purge and refetch.
+			a.log("  cache purge (error page): %s", truncateStr(url, 60))
+			_ = a.db.DeletePage(url)
+		} else {
+			page["title"] = cached.Title
+			page["markdown"] = truncateStr(cached.Markdown, maxChars)
+			page["from_cache"] = true
+			return page
+		}
+	}
+
+	// Live fetch
+	if err := t.Navigate(url); err != nil {
+		a.log("  navigate failed: %s: %v", truncateStr(url, 60), err)
+		return nil
+	}
+	html, err := t.GetHTML()
+	if err != nil {
+		a.log("  HTML failed: %s: %v", truncateStr(url, 60), err)
+		return nil
+	}
+	content, err := parser.Extract(html, url)
+	if err != nil {
+		a.log("  parse failed: %s: %v", truncateStr(url, 60), err)
+		return nil
+	}
+
+	// Detect error pages (DNS, 404, Cloudflare challenge, etc.)
+	if isErrorPage(content.Markdown) {
+		a.log("  error page detected: %s", truncateStr(url, 60))
+		// Do NOT cache error pages — they would poison future lookups.
+		return nil
+	}
+
+	// Store full markdown, return truncated
+	a.db.PutPage(url, content.Title, content.Byline, content.Markdown)
+
+	page["title"] = content.Title
+	page["markdown"] = truncateStr(content.Markdown, maxChars)
+	page["from_cache"] = false
+	return page
 }
 
 // ─── fetch_page (standalone) ────────────────────────────────────
@@ -420,20 +452,27 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 	}
 	forceFresh := intArg(args, "max_age_days", -1, -1, 365) == 0
 
+	t := a.tc.NewThread("main")
+	defer a.closeThread(t)
+
 	if !forceFresh {
 		if cached, err := a.db.GetPage(url); err == nil && cached != nil {
-			a.log("page HIT: %s", truncateStr(url, 60))
-			return jsonString(map[string]any{
-				"url": url, "title": cached.Title, "byline": cached.Byline,
-				"markdown": cached.Markdown, "from_cache": true,
-				"cached_at": cached.UpdatedAt.Format(time.RFC3339),
-			}), nil
+			if isErrorPage(cached.Markdown) {
+				a.log("page purge (error page): %s", truncateStr(url, 60))
+				_ = a.db.DeletePage(url)
+			} else {
+				a.log("page HIT: %s", truncateStr(url, 60))
+				return jsonString(map[string]any{
+					"url": url, "title": cached.Title, "byline": cached.Byline,
+					"markdown": cached.Markdown, "from_cache": true,
+					"cached_at": cached.UpdatedAt.Format(time.RFC3339),
+				}), nil
+			}
 		}
 	}
 
 	a.log("page FETCH: %s", truncateStr(url, 80))
 
-	t := a.tc.NewThread("main")
 	if err := t.Navigate(url); err != nil {
 		return "", fmt.Errorf("navigate: %w", err)
 	}
@@ -446,6 +485,13 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 		return "", fmt.Errorf("parse: %w", err)
 	}
 
+	// Reject error pages (DNS, 404, Cloudflare challenge, etc.) so that
+	// direct fetch_page callers — typically an LLM — never consume them.
+	if isErrorPage(content.Markdown) {
+		a.log("error page detected: %s", truncateStr(url, 60))
+		return "", fmt.Errorf("error page detected at %s (likely 404, DNS, or challenge)", url)
+	}
+
 	markdown := truncateStr(content.Markdown, maxPageCharsFetch)
 	a.db.PutPage(url, content.Title, content.Byline, content.Markdown)
 
@@ -456,6 +502,14 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 }
 
 // ─── helpers ────────────────────────────────────────────────────
+
+// closeThread best-effort closes a research thread. Errors are logged but not
+// propagated — cleanup is non-critical and the registry is purged either way.
+func (a *app) closeThread(t *kimi.Thread) {
+	if err := t.Close(); err != nil {
+		a.log("close thread %q: %v", t.Name(), err)
+	}
+}
 
 func levelArg(args map[string]any, def string) string {
 	raw, _ := args["level"].(string)
@@ -500,4 +554,56 @@ func truncateStr(s string, n int) string {
 		return s[:n] + "\n\n... (truncated)"
 	}
 	return s
+}
+
+// errorPagePatterns are substrings (case-insensitive) that mark a fetched
+// page as a browser/network error rather than real content. Matched against
+// the extracted markdown so a DNS error page or Cloudflare challenge does
+// not pollute the LLM's context.
+var errorPagePatterns = []string{
+	"dns_probe_finished",
+	"nxdomain",
+	"this site can't be reached",
+	"siteye ulaşılamıyor",
+	"404 not found",
+	"http error 404",
+	"http error 5",
+	"sayfa bulunamıyor",
+	"sayfa bulunamadı",
+	"page not found",
+	"access denied",
+	"forbidden",
+	"just a moment",   // Cloudflare interstitial
+	"checking your browser",
+	"captcha",
+	"you have been blocked",
+	"attention required",
+	"rate limit",
+	"too many requests",
+	"err_ssl",
+	"err_connection",
+	"hata kodu",
+	"connection refused",
+	"connection timed out",
+	"this webpage is not available",
+}
+
+// isErrorPage reports whether the given markdown looks like a browser
+// error page (DNS, 404, Cloudflare challenge, etc.) rather than real content.
+func isErrorPage(markdown string) bool {
+	if markdown == "" {
+		return false
+	}
+	lower := strings.ToLower(markdown)
+	// Only scan the first ~2KB to avoid false positives from the body.
+	head := lower
+	if len(head) > 2048 {
+		head = head[:2048]
+	}
+	for _, pat := range errorPagePatterns {
+		if strings.Contains(head, pat) {
+			return true
+		}
+	}
+	return false
 }
