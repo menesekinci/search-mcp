@@ -10,7 +10,7 @@ CYAN="\033[36m"
 RED="\033[31m"
 RESET="\033[0m"
 
-VERSION="${VERSION:-v0.5.1}"
+VERSION="${VERSION:-v0.5.2}"
 REPO="menesekinci/search-mcp"
 INSTALL_DIR="$HOME/.search-mcp"
 

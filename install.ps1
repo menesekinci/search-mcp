@@ -17,7 +17,7 @@ $CYAN = [char]27 + "[36m"
 $RED = [char]27 + "[31m"
 $RESET = [char]27 + "[0m"
 
-$VERSION = "v0.5.1"
+$VERSION = "v0.5.2"
 $REPO = "menesekinci/search-mcp"
 $INSTALL_DIR = "$env:USERPROFILE\.search-mcp"
 $BINARY = "$INSTALL_DIR\search-mcp.exe"
