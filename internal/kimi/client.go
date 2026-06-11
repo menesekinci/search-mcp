@@ -195,3 +195,9 @@ func (c *Client) CloseSession() error {
 	_ = c.do("close_session", nil, nil)
 	return nil
 }
+
+// CloseTab closes the current tab in the session. The session itself
+// (and any Chrome tab group) is preserved.
+func (c *Client) CloseTab() error {
+	return c.do("close_tab", nil, nil)
+}

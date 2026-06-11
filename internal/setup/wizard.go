@@ -11,9 +11,14 @@ import (
 	"strings"
 )
 
-const version = "v0.5.1"
+const defaultVersion = "v0.5.1"
 
 func Run() {
+	version := defaultVersion
+	RunWithVersion(version)
+}
+
+func RunWithVersion(version string) {
 	cyan := "\033[36m"
 	green := "\033[32m"
 	yellow := "\033[33m"
@@ -274,15 +279,21 @@ func checkKimiExtension() bool {
 func testBrowser() {
 	fmt.Printf("  🔍 Running browser test...\n")
 
+	if _, err := exec.LookPath("curl"); err != nil {
+		fmt.Printf("  ⚠️  curl not found on PATH. Skipping live test.\n")
+		return
+	}
+
 	cmd := exec.Command("curl", "-s", "-X", "POST",
 		"http://127.0.0.1:10086/command",
 		"-H", "Content-Type: application/json",
 		"-d", `{"action":"navigate","args":{"url":"https://www.google.com/search?q=hello+world&hl=en","newTab":true,"group_title":"Setup Test"},"session":"setup-test"}`,
 	)
-	cmd.Stdout, cmd.Stderr = nil, nil
+	cmd.Stderr = os.Stderr
 
 	if err := cmd.Run(); err != nil {
-		fmt.Printf("  ⚠️  Browser test failed. Is Chrome open?\n")
+		fmt.Printf("  ⚠️  Browser test failed: %v\n", err)
+		fmt.Printf("     Is Chrome open with the Kimi WebBridge extension active?\n")
 		return
 	}
 

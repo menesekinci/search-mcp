@@ -151,6 +151,14 @@ func (d *DB) PutPage(url, title, byline, markdown string) error {
 	return err
 }
 
+// DeletePage removes a page entry from the cache. Returns nil if the URL
+// was not present. Used to purge error-page entries that were saved
+// before the error-page filter was added.
+func (d *DB) DeletePage(url string) error {
+	_, err := d.db.Exec(`DELETE FROM pages WHERE url = ?`, url)
+	return err
+}
+
 // ─── Stats ──────────────────────────────────────────────────────
 
 func (d *DB) Stats() (searches int, pages int, err error) {

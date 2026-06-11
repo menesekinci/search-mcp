@@ -122,6 +122,30 @@ func (t *Thread) Evaluate(code string) (any, error) {
 	return t.tc.client.Evaluate(code)
 }
 
+// Name returns the thread's identifier.
+func (t *Thread) Name() string { return t.name }
+
+// Close closes this thread's tab and removes it from the registry.
+// After Close, the thread must not be used. Safe to call multiple times.
+func (t *Thread) Close() error {
+	t.tc.mu.Lock()
+	defer t.tc.mu.Unlock()
+
+	state, ok := t.tc.threads[t.name]
+	if !ok {
+		return nil
+	}
+
+	var closeErr error
+	if state.currentURL != "" {
+		_ = t.tc.client.SwitchTab(state.currentURL)
+		closeErr = t.tc.client.CloseTab()
+	}
+
+	delete(t.tc.threads, t.name)
+	return closeErr
+}
+
 // CloseSession closes all tabs in the session.
 func (tc *TabbedClient) CloseSession() error {
 	return tc.client.CloseSession()

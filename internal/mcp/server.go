@@ -51,14 +51,16 @@ type Property struct {
 type Server struct {
 	tools   []Tool
 	handler ToolHandler
+	version string
 }
 
 // ToolHandler is called when a tool is invoked.
 type ToolHandler func(toolName string, args map[string]any) (string, error)
 
-// NewServer creates an MCP server with the given tools.
-func NewServer(tools []Tool, handler ToolHandler) *Server {
-	return &Server{tools: tools, handler: handler}
+// NewServer creates an MCP server with the given tools. version is reported
+// in the initialize response.
+func NewServer(tools []Tool, handler ToolHandler, version string) *Server {
+	return &Server{tools: tools, handler: handler, version: version}
 }
 
 // Run starts the MCP server reading from stdin and writing to stdout.
@@ -124,7 +126,7 @@ func (s *Server) handleInitialize(req Request) Response {
 			},
 			"serverInfo": map[string]string{
 				"name":    "search-mcp",
-				"version": "0.1.0",
+				"version": s.version,
 			},
 		},
 	}
