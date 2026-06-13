@@ -138,12 +138,32 @@ func (t *Thread) Close() error {
 
 	var closeErr error
 	if state.currentURL != "" {
-		_ = t.tc.client.SwitchTab(state.currentURL)
-		closeErr = t.tc.client.CloseTab()
+		// Try to switch to this tab; if it fails, close the current tab
+		// anyway — stale tabs are worse than closing the wrong one.
+		if err := t.tc.client.SwitchTab(state.currentURL); err != nil {
+			_ = t.tc.client.CloseTab()
+		} else {
+			closeErr = t.tc.client.CloseTab()
+		}
 	}
 
 	delete(t.tc.threads, t.name)
 	return closeErr
+}
+
+// CloseAll closes every registered thread's tab, then removes all threads
+// from the registry. Best-effort: errors are logged by the caller.
+func (tc *TabbedClient) CloseAll() {
+	tc.mu.Lock()
+	defer tc.mu.Unlock()
+
+	for name, state := range tc.threads {
+		if state.currentURL != "" {
+			_ = tc.client.SwitchTab(state.currentURL)
+			_ = tc.client.CloseTab()
+		}
+		delete(tc.threads, name)
+	}
 }
 
 // CloseSession closes all tabs in the session.

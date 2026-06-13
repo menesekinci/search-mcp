@@ -175,6 +175,7 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 	fetchCount := searchLevel[level]
 
 	t := a.tc.NewThread("main")
+	defer a.tc.CloseAll()
 	defer a.closeThread(t)
 
 	useCtx7, _ := args["context7"].(bool)
@@ -248,6 +249,7 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		return "", fmt.Errorf("max 5 parallel queries")
 	}
 
+	defer a.tc.CloseAll()
 	defaultLevel := levelArg(args, "medium")
 	globalForce := intArg(args, "max_age_days", -1, -1, 365) == 0
 
@@ -567,6 +569,7 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 	forceFresh := intArg(args, "max_age_days", -1, -1, 365) == 0
 
 	t := a.tc.NewThread("main")
+	defer a.tc.CloseAll()
 	defer a.closeThread(t)
 
 	if !forceFresh {
