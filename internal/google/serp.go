@@ -16,10 +16,10 @@ type Result struct {
 	Snippet    string `json:"snippet,omitempty"`
 }
 
-// VideoSites is the global blocklist of video / streaming platforms.
-// Appended as `-site:domain` exclusions to every Google query so that
-// YouTube, TikTok, Netflix etc. never appear in results.
-var VideoSites = []string{
+// BlockedDomains contains video/streaming platforms whose pages are
+// skipped at fetch time. Domains appear in search results but are not
+// auto-fetched.
+var BlockedDomains = []string{
 	"youtube.com",
 	"youtu.be",
 	"tiktok.com",
@@ -28,19 +28,6 @@ var VideoSites = []string{
 	"dailymotion.com",
 	"twitch.tv",
 	"instagram.com",
-	"facebook.com",
-	"twitter.com",
-	"x.com",
-	"reddit.com",
-}
-
-// appendExclusions builds a copy of query with `-site:domain` for each
-// blocked video site. The original query string is not modified.
-func appendExclusions(query string) string {
-	for _, site := range VideoSites {
-		query += " -site:" + site
-	}
-	return query
 }
 
 // ParseResults extracts organic search results from Google SERP HTML.
@@ -143,9 +130,9 @@ func SearchURL(query string, site string, num int) string {
 
 // SearchURLWithStart builds a Google search URL with pagination offset.
 // start=0 for first page, start=10 for second, etc.
-// Video platforms are always excluded via `-site:domain` operators.
+// Blocked domains (video/streaming) are filtered at fetch time, not excluded from search.
 func SearchURLWithStart(query string, site string, num int, start int) string {
-	q := appendExclusions(query)
+	q := query
 	if site != "" {
 		q = fmt.Sprintf("site:%s %s", site, q)
 	}

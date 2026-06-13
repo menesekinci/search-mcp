@@ -451,8 +451,16 @@ func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int
 }
 
 // fetchOnePage returns a populated page map, or nil if the page could
-// not be fetched or is an error page.
+// not be fetched, is an error page, or belongs to a blocked domain.
 func (a *app) fetchOnePage(t *kimi.Thread, url string, maxChars int) map[string]any {
+	// Blocked domains (video/streaming): skip fetch entirely
+	for _, domain := range google.BlockedDomains {
+		if strings.Contains(url, domain) {
+			a.log("  skip (blocked): %s", truncateStr(url, 60))
+			return nil
+		}
+	}
+
 	page := map[string]any{"url": url}
 
 	// Cache hit
