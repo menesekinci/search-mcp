@@ -367,6 +367,9 @@ func (a *app) doSearch(query, site string, num int, forceFresh bool, t *kimi.Thr
 			return nil, false, fmt.Errorf("navigate: %w", err)
 		}
 
+		// Simulate human scrolling and dwell time on each Google page
+		a.simulateHumanBehavior(t)
+
 		html, err := t.GetHTML()
 		if err != nil {
 			if len(allResults) > 0 {
@@ -564,6 +567,20 @@ func (a *app) closeThread(t *kimi.Thread) {
 	if err := t.Close(); err != nil {
 		a.log("close thread %q: %v", t.Name(), err)
 	}
+}
+
+// simulateHumanBehavior performs random scrolls and dwell time on a loaded
+// page to mimic human browsing patterns and avoid bot detection.
+func (a *app) simulateHumanBehavior(t *kimi.Thread) {
+	scrolls := 1 + rand.Intn(3) // 1-3 smooth scroll movements
+	for i := 0; i < scrolls; i++ {
+		distance := 100 + rand.Intn(600) // 100-700px
+		_, _ = t.Evaluate(fmt.Sprintf(
+			"window.scrollBy({top: %d, left: 0, behavior: 'smooth'});", distance))
+		time.Sleep(time.Duration(150+rand.Intn(350)) * time.Millisecond) // 150-500ms between scrolls
+	}
+	dwellTime := 1000 + rand.Intn(1000) // 1-2s additional page dwell
+	time.Sleep(time.Duration(dwellTime) * time.Millisecond)
 }
 
 func levelArg(args map[string]any, def string) string {
