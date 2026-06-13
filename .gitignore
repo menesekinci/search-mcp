@@ -1,6 +1,7 @@
 # Binary
 /search-mcp.exe
 /search-mcp
+search-mcp-windows-amd64.exe
 
 # Test artifacts
 test_cache.db

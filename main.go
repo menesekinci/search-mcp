@@ -3,10 +3,12 @@ package main
 import (
 	"encoding/json"
 	"fmt"
+	"math/rand"
 	"os"
 	"strings"
 	"time"
 
+	"github.com/menesekinci/search-mcp/internal/context7"
 	"github.com/menesekinci/search-mcp/internal/google"
 	"github.com/menesekinci/search-mcp/internal/kimi"
 	"github.com/menesekinci/search-mcp/internal/mcp"
@@ -17,10 +19,10 @@ import (
 
 // ─── Configuration ──────────────────────────────────────────────
 
-const Version = "v0.5.2"
+const Version = "v0.5.3"
 
 var searchLevel = map[string]int{
-	"low": 3, "medium": 6, "high": 12, "crazy": 24,
+	"low": 6, "medium": 12, "high": 24, "crazy": 48,
 }
 
 const (
@@ -39,8 +41,9 @@ One call = search + fetch. Cached in local SQLite (URL-deduped, permanent).
 
 Single:  {"query": "...", "level": "high", "site": "github.com"}
 Parallel: {"queries": [{"query":"...","site":"..."}, "plain string"], "level": "medium"}
++Context7: {"query": "...", "context7": true} — also queries library docs
 
-Levels: low(3) · medium(6) · high(12) · crazy(24). Default: medium.`,
+Levels: low(6) · medium(12) · high(24) · crazy(48). Default: medium.`,
 		InputSchema: mcp.JSONSchema{
 			Type: "object",
 			Properties: map[string]mcp.Property{
@@ -49,6 +52,7 @@ Levels: low(3) · medium(6) · high(12) · crazy(24). Default: medium.`,
 				"level":        {Type: "string", Description: "low | medium | high | crazy"},
 				"site":         {Type: "string", Description: "Restrict to domain (e.g. github.com)."},
 				"max_age_days": {Type: "number", Description: "0 = force live. Omit = use cache."},
+				"context7":     {Type: "boolean", Description: "Also query Context7 for library docs alongside web search."},
 			},
 		},
 	},
@@ -72,9 +76,10 @@ Use for direct links. Not needed after web_search (it auto-fetches).
 // ─── Application ────────────────────────────────────────────────
 
 type app struct {
-	tc  *kimi.TabbedClient
-	db  *store.DB
-	log logFn
+	tc   *kimi.TabbedClient
+	db   *store.DB
+	log  logFn
+	ctx7 *context7.Client
 }
 
 type logFn func(format string, v ...any)
@@ -107,6 +112,11 @@ func main() {
 		tc:  kimi.NewTabbedClient("search-mcp", "Search MCP"),
 		db:  db,
 		log: logf,
+	}
+
+	if key := os.Getenv("CONTEXT7_API_KEY"); key != "" {
+		app.ctx7 = context7.NewClient(key)
+		logf("context7: enabled")
 	}
 
 	server := mcp.NewServer(tools, func(name string, args map[string]any) (string, error) {
@@ -167,6 +177,18 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 	t := a.tc.NewThread("main")
 	defer a.closeThread(t)
 
+	useCtx7, _ := args["context7"].(bool)
+
+	var ctx7Result *context7.Result
+	var ctx7Done chan struct{}
+	if useCtx7 && a.ctx7 != nil {
+		ctx7Done = make(chan struct{})
+		go func() {
+			defer close(ctx7Done)
+			ctx7Result = a.ctx7.FullQuery(query)
+		}()
+	}
+
 	results, fromCache, err := a.doSearch(query, site, fetchCount, forceFresh, t)
 	if err != nil {
 		return "", err
@@ -174,14 +196,22 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 
 	pages := a.fetchPages(t, results, fetchCount, maxPageCharsSingle)
 
-	return jsonString(map[string]any{
+	if ctx7Done != nil {
+		<-ctx7Done
+	}
+
+	out := map[string]any{
 		"query":         query,
 		"level":         level,
 		"results":       results,
 		"from_cache":    fromCache,
 		"pages_fetched": len(pages),
 		"pages":         pages,
-	}), nil
+	}
+	if ctx7Result != nil {
+		out["context7"] = ctx7Result
+	}
+	return jsonString(out), nil
 }
 
 // ─── parallel search + auto-fetch ───────────────────────────────
@@ -231,12 +261,19 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		FromCache    bool             `json:"from_cache"`
 		PagesFetched int              `json:"pages_fetched"`
 		Pages        []map[string]any `json:"pages"`
+		Context7     *context7.Result `json:"context7,omitempty"`
 		Error        string           `json:"error,omitempty"`
 	}
 
+	useCtx7, _ := args["context7"].(bool)
+
 	var all []threadResult
 
-	for _, spec := range specs {
+	for i, spec := range specs {
+		if i > 0 {
+			jitter := 2000 + rand.Intn(1000)
+			time.Sleep(time.Duration(jitter) * time.Millisecond)
+		}
 		r := threadResult{ID: spec.ID, Query: spec.Query, Level: spec.Level}
 		func() {
 			defer func() {
@@ -254,6 +291,15 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 			t := a.tc.NewThread(spec.ID)
 			defer a.closeThread(t)
 
+			var ctx7Done chan struct{}
+			if useCtx7 && a.ctx7 != nil {
+				ctx7Done = make(chan struct{})
+				go func() {
+					defer close(ctx7Done)
+					r.Context7 = a.ctx7.FullQuery(spec.Query)
+				}()
+			}
+
 			results, fromCache, err := a.doSearch(spec.Query, spec.Site, fetchCount, spec.ForceFresh, t)
 			if err != nil {
 				r.Error = err.Error()
@@ -265,6 +311,10 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 			pages := a.fetchPages(t, results, fetchCount, maxPageCharsParallel)
 			r.Pages = pages
 			r.PagesFetched = len(pages)
+
+			if ctx7Done != nil {
+				<-ctx7Done
+			}
 		}()
 
 		all = append(all, r)
@@ -353,6 +403,11 @@ func (a *app) doSearch(query, site string, num int, forceFresh bool, t *kimi.Thr
 		}
 
 		start += 10
+		// Random delay between pagination requests to avoid bot detection
+		if len(allResults) < num {
+			jitter := 2000 + rand.Intn(1000)
+			time.Sleep(time.Duration(jitter) * time.Millisecond)
+		}
 	}
 
 	if len(allResults) > num {

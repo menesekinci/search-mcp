@@ -42,7 +42,7 @@ func main() {
 	html, _ := t.GetHTML()
 	results, _ := google.ParseResults(html)
 
-	fetchCount := map[string]int{"low": 3, "medium": 6, "high": 12, "crazy": 24}[level]
+	fetchCount := map[string]int{"low": 6, "medium": 12, "high": 24, "crazy": 48}[level]
 	if len(results) > fetchCount {
 		results = results[:fetchCount]
 	}
