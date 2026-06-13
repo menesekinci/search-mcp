@@ -194,24 +194,43 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 		return "", err
 	}
 
-	pages := a.fetchPages(t, results, fetchCount, maxPageCharsSingle)
+	pr := a.fetchPages(t, results, fetchCount, maxPageCharsSingle)
 
 	if ctx7Done != nil {
 		<-ctx7Done
 	}
 
+	summary := buildSummary(len(results), len(pr.pages), pr.cached, pr.skipped)
+
 	out := map[string]any{
 		"query":         query,
 		"level":         level,
+		"summary":       summary,
 		"results":       results,
 		"from_cache":    fromCache,
-		"pages_fetched": len(pages),
-		"pages":         pages,
+		"pages_fetched": len(pr.pages),
+		"pages":         pr.pages,
 	}
 	if ctx7Result != nil {
 		out["context7"] = ctx7Result
 	}
 	return jsonString(out), nil
+}
+
+// buildSummary creates a human-readable summary string for web_search results.
+func buildSummary(totalURLs, fetched, cached, skipped int) string {
+	s := fmt.Sprintf("%d results · %d fetched", totalURLs, fetched)
+	if cached > 0 || skipped > 0 {
+		var parts []string
+		if cached > 0 {
+			parts = append(parts, fmt.Sprintf("%d cached", cached))
+		}
+		if skipped > 0 {
+			parts = append(parts, fmt.Sprintf("%d skipped", skipped))
+		}
+		s += " (" + strings.Join(parts, ", ") + ")"
+	}
+	return s
 }
 
 // ─── parallel search + auto-fetch ───────────────────────────────
@@ -260,6 +279,8 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		Results      []google.Result  `json:"results"`
 		FromCache    bool             `json:"from_cache"`
 		PagesFetched int              `json:"pages_fetched"`
+		PagesCached  int              `json:"pages_cached"`
+		PagesSkipped int              `json:"pages_skipped"`
 		Pages        []map[string]any `json:"pages"`
 		Context7     *context7.Result `json:"context7,omitempty"`
 		Error        string           `json:"error,omitempty"`
@@ -309,8 +330,10 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 			r.FromCache = fromCache
 
 			pages := a.fetchPages(t, results, fetchCount, maxPageCharsParallel)
-			r.Pages = pages
-			r.PagesFetched = len(pages)
+			r.Pages = pages.pages
+			r.PagesFetched = len(pages.pages)
+			r.PagesCached = pages.cached
+			r.PagesSkipped = pages.skipped
 
 			if ctx7Done != nil {
 				<-ctx7Done
@@ -320,7 +343,7 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		all = append(all, r)
 	}
 
-	success, cached, totalPages := 0, 0, 0
+	success, cached, totalPages, totalSkipped := 0, 0, 0, 0
 	for _, tr := range all {
 		if tr.Error == "" {
 			success++
@@ -329,12 +352,26 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 			cached++
 		}
 		totalPages += tr.PagesFetched
+		totalSkipped += tr.PagesSkipped
 	}
 	a.log("parallel: %d/%d ok (%d cached, %d pages)", success, len(all), cached, totalPages)
+
+	summary := fmt.Sprintf("%d queries · %d ok · %d pages", len(all), success, totalPages)
+	if cached > 0 || totalSkipped > 0 {
+		var parts []string
+		if cached > 0 {
+			parts = append(parts, fmt.Sprintf("%d cached", cached))
+		}
+		if totalSkipped > 0 {
+			parts = append(parts, fmt.Sprintf("%d skipped", totalSkipped))
+		}
+		summary += " (" + strings.Join(parts, ", ") + ")"
+	}
 
 	return jsonString(map[string]any{
 		"threads": all, "total": len(all),
 		"success": success, "from_cache": cached, "total_pages": totalPages,
+		"summary": summary,
 	}), nil
 }
 
@@ -424,30 +461,41 @@ func (a *app) doSearch(query, site string, num int, forceFresh bool, t *kimi.Thr
 
 // ─── shared: auto-fetch pages ───────────────────────────────────
 
+// pageResult holds fetch output with quality stats.
+type pageResult struct {
+	pages   []map[string]any
+	cached  int // count of pages served from cache
+	skipped int // count of pages skipped (blocked, error, etc.)
+}
+
 // fetchPages auto-fetches the top N search results as markdown.
 // Broken pages (navigate/HTML/parse failure, or error-page content like
 // DNS NXDOMAIN / Cloudflare challenges) are skipped and the next result
 // is tried, up to `fetchCount` total successes. If no pages can be
-// fetched, the function returns nil.
-func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int, maxChars int) []map[string]any {
+// fetched, the function returns an empty pageResult.
+func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int, maxChars int) pageResult {
 	if len(results) == 0 {
-		return nil
+		return pageResult{}
 	}
 
 	a.log("auto-fetch: up to %d pages [%s]", fetchCount, t.Name())
 	pages := make([]map[string]any, 0, fetchCount)
+	var cached, skipped int
 
 	for i := 0; i < len(results) && len(pages) < fetchCount; i++ {
 		url := results[i].URL
 		page := a.fetchOnePage(t, url, maxChars)
 		if page == nil {
-			// Broken or error page — skip and try the next result.
+			skipped++
 			a.log("  skip: %s", truncateStr(url, 60))
 			continue
 		}
+		if page["from_cache"] == true {
+			cached++
+		}
 		pages = append(pages, page)
 	}
-	return pages
+	return pageResult{pages: pages, cached: cached, skipped: skipped}
 }
 
 // fetchOnePage returns a populated page map, or nil if the page could
@@ -532,6 +580,7 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 					"url": url, "title": cached.Title, "byline": cached.Byline,
 					"markdown": cached.Markdown, "from_cache": true,
 					"cached_at": cached.UpdatedAt.Format(time.RFC3339),
+					"summary":   "1 page fetched (cached)",
 				}), nil
 			}
 		}
@@ -564,6 +613,7 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 	return jsonString(map[string]any{
 		"url": url, "title": content.Title, "byline": content.Byline,
 		"markdown": markdown, "from_cache": false,
+		"summary":  "1 page fetched (live)",
 	}), nil
 }
 
