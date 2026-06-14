@@ -73,7 +73,8 @@ type CachedSearch struct {
 	UpdatedAt time.Time       `json:"updated_at"`
 }
 
-func (d *DB) GetSearch(query, site string) (*CachedSearch, error) {
+// maxAgeDays: 0 = force live (skip cache), -1 = default (7 days), >0 = specific TTL in days.
+func (d *DB) GetSearch(query, site string, maxAgeDays int) (*CachedSearch, error) {
 	var jsonStr string
 	var createdAt, updatedAt time.Time
 	err := d.db.QueryRow(
@@ -90,7 +91,20 @@ func (d *DB) GetSearch(query, site string) (*CachedSearch, error) {
 	if err := json.Unmarshal([]byte(jsonStr), &results); err != nil {
 		return nil, fmt.Errorf("store: unmarshal results: %w", err)
 	}
-	return &CachedSearch{Query: query, Site: site, Results: results, CreatedAt: createdAt, UpdatedAt: updatedAt}, nil
+	cached := &CachedSearch{Query: query, Site: site, Results: results, CreatedAt: createdAt, UpdatedAt: updatedAt}
+
+	// TTL check
+	if maxAgeDays == 0 {
+		return nil, nil // force live
+	}
+	days := maxAgeDays
+	if days < 0 {
+		days = 7 // default 7 days
+	}
+	if time.Since(cached.UpdatedAt).Hours() > float64(days*24) {
+		return nil, nil // expired
+	}
+	return cached, nil
 }
 
 // PutSearch upserts search results. ON CONFLICT handles duplicate query+site natively.
@@ -121,7 +135,38 @@ type CachedPage struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
-func (d *DB) GetPage(url string) (*CachedPage, error) {
+// GetPage returns a cached page if it exists and is within TTL.
+// maxAgeDays: 0 = force live (skip cache), -1 = default (7 days), >0 = specific TTL in days.
+func (d *DB) GetPage(url string, maxAgeDays int) (*CachedPage, error) {
+	var p CachedPage
+	p.URL = url
+	err := d.db.QueryRow(
+		`SELECT title, byline, markdown, created_at, updated_at FROM pages WHERE url = ?`, url,
+	).Scan(&p.Title, &p.Byline, &p.Markdown, &p.CreatedAt, &p.UpdatedAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+
+	// TTL check
+	if maxAgeDays == 0 {
+		return nil, nil // force live
+	}
+	days := maxAgeDays
+	if days < 0 {
+		days = 7 // default 7 days
+	}
+	if time.Since(p.UpdatedAt).Hours() > float64(days*24) {
+		return nil, nil // expired
+	}
+	return &p, nil
+}
+
+// GetPageStale returns the most recent cached page regardless of TTL.
+// Used as a fallback when a live fetch fails for an expired entry.
+func (d *DB) GetPageStale(url string) (*CachedPage, error) {
 	var p CachedPage
 	p.URL = url
 	err := d.db.QueryRow(
@@ -159,10 +204,90 @@ func (d *DB) DeletePage(url string) error {
 	return err
 }
 
+// ─── Maintenance ────────────────────────────────────────────────
+
+// PurgeExpired deletes search and page entries older than maxAgeDays.
+func (d *DB) PurgeExpired(maxAgeDays int) (searchesPurged, pagesPurged int, err error) {
+	res, err := d.db.Exec(`DELETE FROM searches WHERE updated_at < datetime('now', ?)`,
+		fmt.Sprintf("-%d days", maxAgeDays))
+	if err != nil {
+		return 0, 0, err
+	}
+	n, _ := res.RowsAffected()
+	searchesPurged = int(n)
+
+	res, err = d.db.Exec(`DELETE FROM pages WHERE updated_at < datetime('now', ?)`,
+		fmt.Sprintf("-%d days", maxAgeDays))
+	if err != nil {
+		return searchesPurged, 0, err
+	}
+	n, _ = res.RowsAffected()
+	pagesPurged = int(n)
+	return
+}
+
 // ─── Stats ──────────────────────────────────────────────────────
 
+// CacheStats holds aggregate cache statistics.
+type CacheStats struct {
+	Searches       int        `json:"searches"`
+	Pages          int        `json:"pages"`
+	TotalSizeBytes int64      `json:"total_size_bytes"`
+	OldestSearch   *time.Time `json:"oldest_search,omitempty"`
+	NewestPage     *time.Time `json:"newest_page,omitempty"`
+}
+
+// CacheStats returns aggregate statistics about the cache database.
+func (d *DB) CacheStats() (*CacheStats, error) {
+	var s CacheStats
+
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM searches").Scan(&s.Searches); err != nil {
+		return nil, fmt.Errorf("cache stats: count searches: %w", err)
+	}
+	if err := d.db.QueryRow("SELECT COUNT(*) FROM pages").Scan(&s.Pages); err != nil {
+		return nil, fmt.Errorf("cache stats: count pages: %w", err)
+	}
+
+	var pageCount, pageSize int64
+	if err := d.db.QueryRow("PRAGMA page_count").Scan(&pageCount); err != nil {
+		return nil, fmt.Errorf("cache stats: pragma page_count: %w", err)
+	}
+	if err := d.db.QueryRow("PRAGMA page_size").Scan(&pageSize); err != nil {
+		return nil, fmt.Errorf("cache stats: pragma page_size: %w", err)
+	}
+	s.TotalSizeBytes = pageCount * pageSize
+
+	var oldestSearchStr, newestPageStr sql.NullString
+	if err := d.db.QueryRow("SELECT MIN(updated_at) FROM searches").Scan(&oldestSearchStr); err != nil {
+		return nil, fmt.Errorf("cache stats: min search updated_at: %w", err)
+	}
+	if oldestSearchStr.Valid {
+		t, err := time.Parse("2006-01-02 15:04:05", oldestSearchStr.String)
+		if err != nil {
+			return nil, fmt.Errorf("cache stats: parse oldest search: %w", err)
+		}
+		s.OldestSearch = &t
+	}
+	if err := d.db.QueryRow("SELECT MAX(updated_at) FROM pages").Scan(&newestPageStr); err != nil {
+		return nil, fmt.Errorf("cache stats: max page updated_at: %w", err)
+	}
+	if newestPageStr.Valid {
+		t, err := time.Parse("2006-01-02 15:04:05", newestPageStr.String)
+		if err != nil {
+			return nil, fmt.Errorf("cache stats: parse newest page: %w", err)
+		}
+		s.NewestPage = &t
+	}
+
+	return &s, nil
+}
+
 func (d *DB) Stats() (searches int, pages int, err error) {
-	d.db.QueryRow("SELECT COUNT(*) FROM searches").Scan(&searches)
-	d.db.QueryRow("SELECT COUNT(*) FROM pages").Scan(&pages)
+	if err = d.db.QueryRow("SELECT COUNT(*) FROM searches").Scan(&searches); err != nil {
+		return 0, 0, fmt.Errorf("stats: count searches: %w", err)
+	}
+	if err = d.db.QueryRow("SELECT COUNT(*) FROM pages").Scan(&pages); err != nil {
+		return 0, 0, fmt.Errorf("stats: count pages: %w", err)
+	}
 	return
 }
