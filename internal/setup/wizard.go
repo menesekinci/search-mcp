@@ -106,8 +106,7 @@ func RunWithVersion(version string) {
 	fmt.Printf("\n%s%s╔══════════════════════════════════════════════╗%s\n", green, bold, reset)
 	fmt.Printf("%s%s║          Setup Complete! 🎉                  ║%s\n", green, bold, reset)
 	fmt.Printf("%s%s╚══════════════════════════════════════════════╝%s\n\n", green, bold, reset)
-	fmt.Printf("  %s is now configured.\n", selected.name)
-	fmt.Printf("  Cache DB: %s\n\n", filepath.Join(installDir, "cache.db"))
+	fmt.Printf("  %s is now configured.\n\n", selected.name)
 	fmt.Printf("  Try asking your agent:\n")
 	fmt.Printf("  %s\"search for 'golang concurrency patterns'\"%s\n\n", yellow, reset)
 }

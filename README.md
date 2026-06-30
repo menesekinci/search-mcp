@@ -64,8 +64,8 @@ Agent → MCP stdio → search-mcp.exe → Kimi WebBridge → Chrome → Google
 ```
 
 - **Pagination:** auto-paginates Google until target result count is hit
-- **Dedup:** URL-based, same page never fetched twice
-- **Cache:** SQLite at `~/.search-mcp/cache.db`. Entries are served for 7 days by default (`max_age_days` overrides per call; `0` forces a live fetch). Rows are garbage-collected after 30 days, and an expired row is still used as a stale fallback if a live fetch fails.
+- **Dedup:** URL-based within a search, same page never fetched twice
+- **Always live:** no cache, no local database — every call hits Google and the target pages fresh. True to the research spirit.
 - **Multi-query:** `queries: [...]` runs each query sequentially in its own Chrome tab (with a short randomized delay between them to avoid bot detection). Within a single query, the top results are fetched concurrently (up to 3 at a time).
 
 ## 📦 Tools
@@ -79,7 +79,7 @@ Agent → MCP stdio → search-mcp.exe → Kimi WebBridge → Chrome → Google
 
 ```bash
 search-mcp setup       # Interactive setup wizard
-search-mcp --version   # v0.5.3
+search-mcp --version   # v0.6.0
 search-mcp             # MCP server (stdio mode)
 ```
 

@@ -15,12 +15,11 @@ import (
 	"github.com/menesekinci/search-mcp/internal/mcp"
 	"github.com/menesekinci/search-mcp/internal/parser"
 	"github.com/menesekinci/search-mcp/internal/setup"
-	"github.com/menesekinci/search-mcp/internal/store"
 )
 
 // ─── Configuration ──────────────────────────────────────────────
 
-const Version = "v0.5.3"
+const Version = "v0.6.0"
 
 var searchLevel = map[string]int{
 	"low": 6, "medium": 12, "high": 24, "crazy": 48,
@@ -32,20 +31,13 @@ const (
 	maxPageCharsFetch    = 30000 // per-page markdown in fetch_page (standalone)
 )
 
-// cacheRetentionDays bounds how long cache rows survive on disk. It is the
-// startup garbage-collection window, kept well above the 7-day default
-// freshness TTL so that (a) callers passing a longer max_age_days still get
-// hits and (b) expired-but-recent rows remain available for stale fallback
-// when a live fetch fails.
-const cacheRetentionDays = 30
-
 // ─── MCP tool definitions ───────────────────────────────────────
 
 var tools = []mcp.Tool{
 	{
 		Name: "web_search",
 		Description: `Search Google via real Chrome, then auto-fetch the top results as clean markdown.
-One call = search + fetch. Cached in local SQLite (URL-deduped, permanent).
+One call = search + fetch. Always live — every call hits Google fresh, nothing is cached.
 
 Single:  {"query": "...", "level": "high", "site": "github.com"}
 Parallel: {"queries": [{"query":"...","site":"..."}, "plain string"], "level": "medium"}
@@ -55,36 +47,26 @@ Levels: low(6) · medium(12) · high(24) · crazy(48). Default: medium.`,
 		InputSchema: mcp.JSONSchema{
 			Type: "object",
 			Properties: map[string]mcp.Property{
-				"query":        {Type: "string", Description: "Search terms. Supports site:, filetype:, -term, \"phrase\"."},
-				"queries":      {Type: "array", Description: "Multiple queries for parallel research (2-5)."},
-				"level":        {Type: "string", Description: "low | medium | high | crazy"},
-				"site":         {Type: "string", Description: "Restrict to domain (e.g. github.com)."},
-				"max_age_days": {Type: "number", Description: "0 = force live. Omit = use cache."},
-				"context7":     {Type: "boolean", Description: "Also query Context7 for library docs alongside web search."},
+				"query":    {Type: "string", Description: "Search terms. Supports site:, filetype:, -term, \"phrase\"."},
+				"queries":  {Type: "array", Description: "Multiple queries for parallel research (2-5)."},
+				"level":    {Type: "string", Description: "low | medium | high | crazy"},
+				"site":     {Type: "string", Description: "Restrict to domain (e.g. github.com)."},
+				"context7": {Type: "boolean", Description: "Also query Context7 for library docs alongside web search."},
 			},
 		},
 	},
 	{
 		Name: "fetch_page",
 		Description: `Fetch a specific URL, extract main content, return clean markdown.
-Use for direct links. Not needed after web_search (it auto-fetches).
+Use for direct links. Not needed after web_search (it auto-fetches). Always live.
 
-{"url": "https://example.com/article", "max_age_days": 0}`,
+{"url": "https://example.com/article"}`,
 		InputSchema: mcp.JSONSchema{
 			Type: "object",
 			Properties: map[string]mcp.Property{
-				"url":          {Type: "string", Description: "Page URL."},
-				"max_age_days": {Type: "number", Description: "0 = force live. Omit = use cache."},
+				"url": {Type: "string", Description: "Page URL."},
 			},
 			Required: []string{"url"},
-		},
-	},
-	{
-		Name:        "cache_stats",
-		Description: "Show cache statistics (searches, pages, size, date range).",
-		InputSchema: mcp.JSONSchema{
-			Type: "object",
-			Properties: map[string]mcp.Property{},
 		},
 	},
 }
@@ -93,7 +75,6 @@ Use for direct links. Not needed after web_search (it auto-fetches).
 
 type app struct {
 	tc   *kimi.TabbedClient
-	db   *store.DB
 	log  logFn
 	ctx7 *context7.Client
 }
@@ -117,21 +98,8 @@ func main() {
 		fmt.Fprintf(os.Stderr, "[search-mcp] "+format+"\n", v...)
 	}
 
-	db, err := store.Open("")
-	must(err, "open db", logf)
-	defer db.Close()
-
-	sCount, pCount, _ := db.Stats()
-	logf("cache: %d searches, %d pages", sCount, pCount)
-
-	sp, pp, _ := db.PurgeExpired(cacheRetentionDays)
-	if sp+pp > 0 {
-		logf("purged: %d searches, %d pages (older than %d days)", sp, pp, cacheRetentionDays)
-	}
-
 	app := &app{
 		tc:  kimi.NewTabbedClient("search-mcp", "Search MCP"),
-		db:  db,
 		log: logf,
 	}
 
@@ -152,21 +120,12 @@ func main() {
 	}
 }
 
-func must(err error, ctx string, logf logFn) {
-	if err != nil {
-		logf("fatal %s: %v", ctx, err)
-		os.Exit(1)
-	}
-}
-
 func (a *app) handle(name string, args map[string]any) (string, error) {
 	switch name {
 	case "web_search":
 		return a.webSearch(args)
 	case "fetch_page":
 		return a.fetchPage(args)
-	case "cache_stats":
-		return a.cacheStats(args)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
@@ -194,7 +153,6 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 
 	level := levelArg(args, "medium")
 	site, _ := args["site"].(string)
-	maxAgeDays := intArg(args, "max_age_days", -1, -1, 365)
 	fetchCount := searchLevel[level]
 
 	t := a.tc.NewThread("main")
@@ -213,25 +171,24 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 		}()
 	}
 
-	results, fromCache, err := a.doSearch(query, site, fetchCount, maxAgeDays, t)
+	results, err := a.doSearch(query, site, fetchCount, t)
 	if err != nil {
 		return "", err
 	}
 
-	pr := a.fetchPages(t, results, fetchCount, maxPageCharsSingle, maxAgeDays)
+	pr := a.fetchPages(t, results, fetchCount, maxPageCharsSingle)
 
 	if ctx7Done != nil {
 		<-ctx7Done
 	}
 
-	summary := buildSummary(len(results), len(pr.pages), pr.cached, pr.skipped)
+	summary := buildSummary(len(results), len(pr.pages), pr.skipped)
 
 	out := map[string]any{
 		"query":         query,
 		"level":         level,
 		"summary":       summary,
 		"results":       results,
-		"from_cache":    fromCache,
 		"pages_fetched": len(pr.pages),
 		"pages":         pr.pages,
 		"skipped_urls":  pr.skippedURLs,
@@ -243,17 +200,10 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 }
 
 // buildSummary creates a human-readable summary string for web_search results.
-func buildSummary(totalURLs, fetched, cached, skipped int) string {
+func buildSummary(totalURLs, fetched, skipped int) string {
 	s := fmt.Sprintf("%d results · %d fetched", totalURLs, fetched)
-	if cached > 0 || skipped > 0 {
-		var parts []string
-		if cached > 0 {
-			parts = append(parts, fmt.Sprintf("%d cached", cached))
-		}
-		if skipped > 0 {
-			parts = append(parts, fmt.Sprintf("%d skipped", skipped))
-		}
-		s += " (" + strings.Join(parts, ", ") + ")"
+	if skipped > 0 {
+		s += fmt.Sprintf(" (%d skipped)", skipped)
 	}
 	return s
 }
@@ -261,11 +211,10 @@ func buildSummary(totalURLs, fetched, cached, skipped int) string {
 // ─── parallel search + auto-fetch ───────────────────────────────
 
 type querySpec struct {
-	Query      string
-	Site       string
-	Level      string
-	ID         string
-	MaxAgeDays int
+	Query string
+	Site  string
+	Level string
+	ID    string
 }
 
 func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, error) {
@@ -275,7 +224,6 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 
 	defer a.tc.CloseAll()
 	defaultLevel := levelArg(args, "medium")
-	globalMaxAge := intArg(args, "max_age_days", -1, -1, 365)
 
 	specs := make([]querySpec, 0, len(rawQueries))
 	for i, q := range rawQueries {
@@ -283,21 +231,14 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		case string:
 			specs = append(specs, querySpec{
 				Query: v, Level: defaultLevel,
-				ID:         fmt.Sprintf("t%d", i),
-				MaxAgeDays: globalMaxAge,
+				ID: fmt.Sprintf("t%d", i),
 			})
 		case map[string]any:
-			specMaxAge := intArg(v, "max_age_days", -1, -1, 365)
-			maxAge := globalMaxAge
-			if specMaxAge != -1 {
-				maxAge = specMaxAge
-			}
 			specs = append(specs, querySpec{
-				Query:      orDefault(fmt.Sprint(v["query"]), ""),
-				Site:       orDefault(fmt.Sprint(v["site"]), ""),
-				Level:      orDefault(fmt.Sprint(v["level"]), defaultLevel),
-				ID:         orDefault(fmt.Sprint(v["id"]), fmt.Sprintf("t%d", i)),
-				MaxAgeDays: maxAge,
+				Query: orDefault(fmt.Sprint(v["query"]), ""),
+				Site:  orDefault(fmt.Sprint(v["site"]), ""),
+				Level: orDefault(fmt.Sprint(v["level"]), defaultLevel),
+				ID:    orDefault(fmt.Sprint(v["id"]), fmt.Sprintf("t%d", i)),
 			})
 		}
 	}
@@ -309,9 +250,7 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		Query        string              `json:"query"`
 		Level        string              `json:"level"`
 		Results      []google.Result     `json:"results"`
-		FromCache    bool                `json:"from_cache"`
 		PagesFetched int                 `json:"pages_fetched"`
-		PagesCached  int                 `json:"pages_cached"`
 		PagesSkipped int                 `json:"pages_skipped"`
 		Pages        []map[string]any    `json:"pages"`
 		SkippedURLs  []map[string]string `json:"skipped_urls,omitempty"`
@@ -355,18 +294,16 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 				}()
 			}
 
-			results, fromCache, err := a.doSearch(spec.Query, spec.Site, fetchCount, spec.MaxAgeDays, t)
+			results, err := a.doSearch(spec.Query, spec.Site, fetchCount, t)
 			if err != nil {
 				r.Error = err.Error()
 				return
 			}
 			r.Results = results
-			r.FromCache = fromCache
 
-			pages := a.fetchPages(t, results, fetchCount, maxPageCharsParallel, spec.MaxAgeDays)
+			pages := a.fetchPages(t, results, fetchCount, maxPageCharsParallel)
 			r.Pages = pages.pages
 			r.PagesFetched = len(pages.pages)
-			r.PagesCached = pages.cached
 			r.PagesSkipped = pages.skipped
 			r.SkippedURLs = pages.skippedURLs
 
@@ -379,58 +316,32 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		allSkippedURLs = append(allSkippedURLs, r.SkippedURLs...)
 	}
 
-	success, cached, totalPages, totalSkipped := 0, 0, 0, 0
+	success, totalPages, totalSkipped := 0, 0, 0
 	for _, tr := range all {
 		if tr.Error == "" {
 			success++
 		}
-		if tr.FromCache {
-			cached++
-		}
 		totalPages += tr.PagesFetched
 		totalSkipped += tr.PagesSkipped
 	}
-	a.log("parallel: %d/%d ok (%d cached, %d pages)", success, len(all), cached, totalPages)
+	a.log("parallel: %d/%d ok (%d pages)", success, len(all), totalPages)
 
 	summary := fmt.Sprintf("%d queries · %d ok · %d pages", len(all), success, totalPages)
-	if cached > 0 || totalSkipped > 0 {
-		var parts []string
-		if cached > 0 {
-			parts = append(parts, fmt.Sprintf("%d cached", cached))
-		}
-		if totalSkipped > 0 {
-			parts = append(parts, fmt.Sprintf("%d skipped", totalSkipped))
-		}
-		summary += " (" + strings.Join(parts, ", ") + ")"
+	if totalSkipped > 0 {
+		summary += fmt.Sprintf(" (%d skipped)", totalSkipped)
 	}
 
 	return jsonString(map[string]any{
 		"threads": all, "total": len(all),
-		"success": success, "from_cache": cached, "total_pages": totalPages,
+		"success": success, "total_pages": totalPages,
 		"summary":      summary,
 		"skipped_urls": allSkippedURLs,
 	}), nil
 }
 
-// ─── shared: search (cache → live, with pagination) ────────────
+// ─── shared: live search with pagination ───────────────────────
 
-func (a *app) doSearch(query, site string, num int, maxAgeDays int, t *kimi.Thread) ([]google.Result, bool, error) {
-	if maxAgeDays != 0 {
-		if cached, err := a.db.GetSearch(query, site, maxAgeDays); err == nil && cached != nil {
-			// Only serve from cache when it holds at least as many results as
-			// requested. A later, higher level (e.g. low→high) asks for more
-			// than an earlier search stored, so fall through to a live search
-			// that re-paginates and upserts the larger result set.
-			if len(cached.Results) >= num {
-				cached.Results = cached.Results[:num]
-				a.log("cache HIT [%s]: %q (%d results)", t.Name(), query, len(cached.Results))
-				return cached.Results, true, nil
-			}
-			a.log("cache PARTIAL [%s]: %q (%d cached < %d requested) — refetching",
-				t.Name(), query, len(cached.Results), num)
-		}
-	}
-
+func (a *app) doSearch(query, site string, num int, t *kimi.Thread) ([]google.Result, error) {
 	a.log("search [%s]: %q (target: %d)", t.Name(), query, num)
 
 	var allResults []google.Result
@@ -444,7 +355,7 @@ func (a *app) doSearch(query, site string, num int, maxAgeDays int, t *kimi.Thre
 			if len(allResults) > 0 {
 				break // got some results, stop paginating
 			}
-			return nil, false, fmt.Errorf("navigate: %w", err)
+			return nil, fmt.Errorf("navigate: %w", err)
 		}
 
 		// Simulate human scrolling and dwell time on each Google page
@@ -455,7 +366,7 @@ func (a *app) doSearch(query, site string, num int, maxAgeDays int, t *kimi.Thre
 			if len(allResults) > 0 {
 				break
 			}
-			return nil, false, fmt.Errorf("get HTML: %w", err)
+			return nil, fmt.Errorf("get HTML: %w", err)
 		}
 
 		results, err := google.ParseResults(html)
@@ -463,7 +374,7 @@ func (a *app) doSearch(query, site string, num int, maxAgeDays int, t *kimi.Thre
 			if len(allResults) > 0 {
 				break
 			}
-			return nil, false, fmt.Errorf("parse: %w", err)
+			return nil, fmt.Errorf("parse: %w", err)
 		}
 
 		// Deduplicate and add
@@ -497,9 +408,8 @@ func (a *app) doSearch(query, site string, num int, maxAgeDays int, t *kimi.Thre
 		allResults = allResults[:num]
 	}
 
-	a.db.PutSearch(query, site, allResults)
 	a.log("→ %d results (%d pages)", len(allResults), start/10+1)
-	return allResults, false, nil
+	return allResults, nil
 }
 
 // ─── shared: auto-fetch pages ───────────────────────────────────
@@ -507,7 +417,6 @@ func (a *app) doSearch(query, site string, num int, maxAgeDays int, t *kimi.Thre
 // pageResult holds fetch output with quality stats.
 type pageResult struct {
 	pages       []map[string]any
-	cached      int                 // count of pages served from cache
 	skipped     int                 // count of pages skipped (blocked, error, etc.)
 	skippedURLs []map[string]string // [{url, reason}]
 }
@@ -519,7 +428,7 @@ type pageResult struct {
 // This way broken pages are skipped without eagerly fetching a large fixed
 // buffer of extra results that would just be discarded. If no pages can be
 // fetched, returns an empty pageResult.
-func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int, maxChars int, maxAgeDays int) pageResult {
+func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int, maxChars int) pageResult {
 	if len(results) == 0 {
 		return pageResult{}
 	}
@@ -531,16 +440,15 @@ func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int
 	type fetchResult struct {
 		page       map[string]any
 		skipReason string
-		fromCache  bool
 	}
 
 	pages := make([]map[string]any, 0, fetchCount)
-	var cached, skipped int
+	var skipped int
 	var skippedURLs []map[string]string
 
 	// Walk results in batches, stopping once fetchCount pages succeed. At most
 	// maxConcurrent-1 results beyond the last needed one are fetched (the tail
-	// of the final batch), versus the previous fixed fetchCount+10 buffer.
+	// of the final batch).
 	for next := 0; next < len(results) && len(pages) < fetchCount; {
 		batch := maxConcurrent
 		if remaining := len(results) - next; remaining < batch {
@@ -556,12 +464,8 @@ func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int
 				ft := a.tc.NewThread(fmt.Sprintf("%s-fetch-%d", t.Name(), idx))
 				defer a.closeThread(ft)
 
-				page, skipReason := a.fetchOnePage(ft, results[idx].URL, maxChars, maxAgeDays)
-				batchRes[slot] = fetchResult{
-					page:       page,
-					skipReason: skipReason,
-					fromCache:  page != nil && page["from_cache"] == true,
-				}
+				page, skipReason := a.fetchOnePage(ft, results[idx].URL, maxChars)
+				batchRes[slot] = fetchResult{page: page, skipReason: skipReason}
 			}(j, next+j)
 		}
 		wg.Wait()
@@ -575,78 +479,32 @@ func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int
 				a.log("  skip: %s", truncLog(url, 60))
 				continue
 			}
-			if fr.fromCache {
-				cached++
-			}
 			pages = append(pages, fr.page)
 		}
 		next += batch
 	}
 
-	return pageResult{pages: pages, cached: cached, skipped: skipped, skippedURLs: skippedURLs}
+	return pageResult{pages: pages, skipped: skipped, skippedURLs: skippedURLs}
 }
 
-// fetchOnePage returns a populated page map and an empty skip reason on success,
-// or nil and a non-empty reason if the page could not be fetched, is an error
-// page, or belongs to a blocked domain.
-func (a *app) fetchOnePage(t *kimi.Thread, url string, maxChars int, maxAgeDays int) (map[string]any, string) {
+// fetchOnePage navigates to url, extracts the main content and returns a
+// populated page map with an empty skip reason on success. It returns nil and a
+// non-empty reason if the page could not be fetched, is an error page, or
+// belongs to a blocked domain.
+func (a *app) fetchOnePage(t *kimi.Thread, url string, maxChars int) (map[string]any, string) {
 	// Blocked domains (video/streaming): skip fetch entirely
 	if google.IsBlockedDomain(url) {
 		a.log("  skip (blocked): %s", truncLog(url, 60))
 		return nil, "blocked domain"
 	}
 
-	page := map[string]any{"url": url}
-
-	// Cache hit (TTL-aware)
-	if cached, err := a.db.GetPage(url, maxAgeDays); err == nil && cached != nil {
-		if isErrorPage(cached.Markdown) {
-			// Cached entry is an error page — purge and refetch.
-			a.log("  cache purge (error page): %s", truncLog(url, 60))
-			_ = a.db.DeletePage(url)
-		} else {
-			page["title"] = cached.Title
-			truncatedMD, origLen, wasTruncated := middleTruncate(cached.Markdown, maxChars)
-			page["markdown"] = truncatedMD
-			page["truncated"] = wasTruncated
-			page["original_length"] = origLen
-			page["from_cache"] = true
-			return page, ""
-		}
-	}
-
-	// Live fetch
 	if err := t.Navigate(url); err != nil {
 		a.log("  navigate failed: %s: %v", truncLog(url, 60), err)
-		// Stale fallback: serve expired cache entry if live fetch fails
-		if stale, sErr := a.db.GetPageStale(url); sErr == nil && stale != nil && !isErrorPage(stale.Markdown) {
-			a.log("  stale fallback: %s", truncLog(url, 60))
-			page["title"] = stale.Title
-			truncatedMD, origLen, wasTruncated := middleTruncate(stale.Markdown, maxChars)
-			page["markdown"] = truncatedMD
-			page["truncated"] = wasTruncated
-			page["original_length"] = origLen
-			page["from_cache"] = true
-			page["stale"] = true
-			return page, ""
-		}
 		return nil, "navigate error"
 	}
 	html, err := t.GetHTML()
 	if err != nil {
 		a.log("  HTML failed: %s: %v", truncLog(url, 60), err)
-		// Stale fallback
-		if stale, sErr := a.db.GetPageStale(url); sErr == nil && stale != nil && !isErrorPage(stale.Markdown) {
-			a.log("  stale fallback: %s", truncLog(url, 60))
-			page["title"] = stale.Title
-			truncatedMD, origLen, wasTruncated := middleTruncate(stale.Markdown, maxChars)
-			page["markdown"] = truncatedMD
-			page["truncated"] = wasTruncated
-			page["original_length"] = origLen
-			page["from_cache"] = true
-			page["stale"] = true
-			return page, ""
-		}
 		return nil, "HTML error"
 	}
 	content, err := parser.Extract(html, url)
@@ -658,20 +516,17 @@ func (a *app) fetchOnePage(t *kimi.Thread, url string, maxChars int, maxAgeDays 
 	// Detect error pages (DNS, 404, Cloudflare challenge, etc.)
 	if isErrorPage(content.Markdown) {
 		a.log("  error page detected: %s", truncLog(url, 60))
-		// Do NOT cache error pages — they would poison future lookups.
 		return nil, "error page detected"
 	}
 
-	// Store full markdown, return truncated
-	a.db.PutPage(url, content.Title, content.Byline, content.Markdown)
-
-	page["title"] = content.Title
 	truncatedMD, origLen, wasTruncated := middleTruncate(content.Markdown, maxChars)
-	page["markdown"] = truncatedMD
-	page["truncated"] = wasTruncated
-	page["original_length"] = origLen
-	page["from_cache"] = false
-	return page, ""
+	return map[string]any{
+		"url":             url,
+		"title":           content.Title,
+		"markdown":        truncatedMD,
+		"truncated":       wasTruncated,
+		"original_length": origLen,
+	}, ""
 }
 
 // ─── fetch_page (standalone) ────────────────────────────────────
@@ -681,62 +536,18 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 	if url == "" {
 		return "", fmt.Errorf("url is required")
 	}
-	maxAgeDays := intArg(args, "max_age_days", -1, -1, 365)
 
 	t := a.tc.NewThread("main")
 	defer a.tc.CloseAll()
 	defer a.closeThread(t)
 
-	if maxAgeDays != 0 {
-		if cached, err := a.db.GetPage(url, maxAgeDays); err == nil && cached != nil {
-			if isErrorPage(cached.Markdown) {
-				a.log("page purge (error page): %s", truncLog(url, 60))
-				_ = a.db.DeletePage(url)
-			} else {
-				a.log("page HIT: %s", truncLog(url, 60))
-				truncatedMD, origLen, wasTruncated := middleTruncate(cached.Markdown, maxPageCharsFetch)
-				return jsonString(map[string]any{
-					"url": url, "title": cached.Title, "byline": cached.Byline,
-					"markdown": truncatedMD, "from_cache": true,
-					"truncated": wasTruncated, "original_length": origLen,
-					"cached_at": cached.UpdatedAt.Format(time.RFC3339),
-					"summary":   "1 page fetched (cached)",
-				}), nil
-			}
-		}
-	}
-
 	a.log("page FETCH: %s", truncLog(url, 80))
 
 	if err := t.Navigate(url); err != nil {
-		// Stale fallback: serve expired cache entry if live fetch fails
-		if stale, sErr := a.db.GetPageStale(url); sErr == nil && stale != nil && !isErrorPage(stale.Markdown) {
-			a.log("page STALE: %s", truncLog(url, 60))
-			truncatedMD, origLen, wasTruncated := middleTruncate(stale.Markdown, maxPageCharsFetch)
-			return jsonString(map[string]any{
-				"url": url, "title": stale.Title, "byline": stale.Byline,
-				"markdown": truncatedMD, "from_cache": true, "stale": true,
-				"truncated": wasTruncated, "original_length": origLen,
-				"cached_at": stale.UpdatedAt.Format(time.RFC3339),
-				"summary":   "1 page fetched (stale cache)",
-			}), nil
-		}
 		return "", fmt.Errorf("navigate: %w", err)
 	}
 	html, err := t.GetHTML()
 	if err != nil {
-		// Stale fallback
-		if stale, sErr := a.db.GetPageStale(url); sErr == nil && stale != nil && !isErrorPage(stale.Markdown) {
-			a.log("page STALE: %s", truncLog(url, 60))
-			truncatedMD, origLen, wasTruncated := middleTruncate(stale.Markdown, maxPageCharsFetch)
-			return jsonString(map[string]any{
-				"url": url, "title": stale.Title, "byline": stale.Byline,
-				"markdown": truncatedMD, "from_cache": true, "stale": true,
-				"truncated": wasTruncated, "original_length": origLen,
-				"cached_at": stale.UpdatedAt.Format(time.RFC3339),
-				"summary":   "1 page fetched (stale cache)",
-			}), nil
-		}
 		return "", fmt.Errorf("get HTML: %w", err)
 	}
 	content, err := parser.Extract(html, url)
@@ -752,32 +563,12 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 	}
 
 	truncatedMD, origLen, wasTruncated := middleTruncate(content.Markdown, maxPageCharsFetch)
-	a.db.PutPage(url, content.Title, content.Byline, content.Markdown)
 
 	return jsonString(map[string]any{
 		"url": url, "title": content.Title, "byline": content.Byline,
-		"markdown": truncatedMD, "from_cache": false,
+		"markdown":  truncatedMD,
 		"truncated": wasTruncated, "original_length": origLen,
 		"summary": "1 page fetched (live)",
-	}), nil
-}
-
-// ─── cache_stats ────────────────────────────────────────────────
-
-func (a *app) cacheStats(args map[string]any) (string, error) {
-	stats, err := a.db.CacheStats()
-	if err != nil {
-		return "", fmt.Errorf("cache_stats: %w", err)
-	}
-	sCount, pCount, _ := a.db.Stats()
-	return jsonString(map[string]any{
-		"searches":         stats.Searches,
-		"pages":            stats.Pages,
-		"total_size_bytes": stats.TotalSizeBytes,
-		"total_size_mb":    float64(stats.TotalSizeBytes) / (1024 * 1024),
-		"oldest_search":    stats.OldestSearch,
-		"newest_page":      stats.NewestPage,
-		"summary":          fmt.Sprintf("%d searches, %d pages, %.1f MB", sCount, pCount, float64(stats.TotalSizeBytes)/(1024*1024)),
 	}), nil
 }
 
@@ -814,21 +605,6 @@ func levelArg(args map[string]any, def string) string {
 		return raw
 	}
 	return def
-}
-
-func intArg(args map[string]any, key string, def, min, max int) int {
-	v, ok := args[key].(float64)
-	if !ok {
-		return def
-	}
-	n := int(v)
-	if n < min {
-		return min
-	}
-	if n > max {
-		return max
-	}
-	return n
 }
 
 func orDefault(val, def string) string {
@@ -884,7 +660,7 @@ var strongErrorPatterns = []string{
 	"http error 404",
 	"http error 5",
 	"sayfa bulunamıyor",
-	"just a moment",   // Cloudflare interstitial
+	"just a moment", // Cloudflare interstitial
 	"checking your browser",
 	"you have been blocked",
 	"attention required",

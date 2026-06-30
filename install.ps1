@@ -218,7 +218,6 @@ Write-Host "$GREEN$BOLD║              Installation Complete! 🎉             
 Write-Host "$GREEN$BOLD╚══════════════════════════════════════════════════════╝$RESET"
 Write-Host ""
 Write-Host "  Binary:    $BINARY"
-Write-Host "  Cache DB:  $INSTALL_DIR\cache.db"
 Write-Host "  Setup:     search-mcp setup"
 Write-Host "  Version:   search-mcp --version"
 Write-Host ""

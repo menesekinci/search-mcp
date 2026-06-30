@@ -4,7 +4,6 @@
 search-mcp-windows-amd64.exe
 
 # Test artifacts
-test_cache.db
 *.test
 
 # IDE
