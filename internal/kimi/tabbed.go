@@ -85,19 +85,6 @@ func (t *Thread) Navigate(url string) error {
 	return nil
 }
 
-// SwitchTo ensures this thread's tab is the active one.
-func (t *Thread) SwitchTo() error {
-	t.tc.mu.Lock()
-	defer t.tc.mu.Unlock()
-
-	state, ok := t.tc.threads[t.name]
-	if !ok || state.currentURL == "" {
-		return fmt.Errorf("thread %q has no active tab", t.name)
-	}
-
-	return t.tc.client.SwitchTab(state.currentURL)
-}
-
 // GetHTML returns the full page HTML from this thread's tab.
 func (t *Thread) GetHTML() (string, error) {
 	t.tc.mu.Lock()

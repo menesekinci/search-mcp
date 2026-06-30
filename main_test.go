@@ -39,6 +39,20 @@ func TestIsErrorPage_Empty(t *testing.T) {
 	}
 }
 
+func TestValidLevel(t *testing.T) {
+	for _, lv := range []string{"low", "medium", "high", "crazy"} {
+		if got := validLevel(lv, "medium"); got != lv {
+			t.Errorf("validLevel(%q) = %q, want %q", lv, got, lv)
+		}
+	}
+	// Unknown or empty levels normalize to the default.
+	for _, lv := range []string{"", "xyz", "<nil>", "HIGH"} {
+		if got := validLevel(lv, "medium"); got != "medium" {
+			t.Errorf("validLevel(%q) = %q, want default \"medium\"", lv, got)
+		}
+	}
+}
+
 func repeat(s string, n int) string {
 	out := make([]byte, 0, len(s)*n)
 	for i := 0; i < n; i++ {

@@ -80,7 +80,7 @@ Agent → MCP stdio → search-mcp.exe → Kimi WebBridge → Chrome → Google
 
 ```bash
 search-mcp setup       # Interactive setup wizard
-search-mcp --version   # v0.6.0
+search-mcp --version   # v0.7.0
 search-mcp             # MCP server (stdio mode)
 ```
 

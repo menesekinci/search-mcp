@@ -177,19 +177,6 @@ func (c *Client) GetHTML() (string, error) {
 	return s, nil
 }
 
-// GetTitle returns document.title from the current tab.
-func (c *Client) GetTitle() (string, error) {
-	v, err := c.Evaluate("document.title")
-	if err != nil {
-		return "", err
-	}
-	s, ok := v.(string)
-	if !ok {
-		return "", fmt.Errorf("kimi: expected string title, got %T", v)
-	}
-	return s, nil
-}
-
 // CloseSession closes all tabs in the session.
 func (c *Client) CloseSession() error {
 	_ = c.do("close_session", nil, nil)

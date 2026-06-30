@@ -18,17 +18,11 @@ import (
 
 // ─── Configuration ──────────────────────────────────────────────
 
-const Version = "v0.6.0"
+const Version = "v0.7.0"
 
 var searchLevel = map[string]int{
 	"low": 6, "medium": 12, "high": 24, "crazy": 48,
 }
-
-const (
-	maxPageCharsSingle   = 8000  // per-page markdown in web_search
-	maxPageCharsParallel = 6000  // per-page markdown in parallel mode
-	maxPageCharsFetch    = 30000 // per-page markdown in fetch_page (standalone)
-)
 
 // ─── MCP tool definitions ───────────────────────────────────────
 
@@ -37,20 +31,21 @@ var tools = []mcp.Tool{
 		Name: "web_search",
 		Description: `Search Google via real Chrome, then auto-fetch the top results as clean markdown.
 One call = search + fetch. Always live — every call hits Google fresh, nothing is cached.
+Full page content is returned untruncated.
 
-Single:  {"query": "...", "level": "high", "site": "github.com"}
-Parallel: {"queries": [{"query":"...","site":"..."}, "plain string"], "level": "medium"}
-+Context7: {"query": "...", "context7": true} — also queries library docs
+Single:     {"query": "...", "level": "high", "site": "github.com"}
+Multi-query: {"queries": [{"query":"...","site":"..."}, "plain string"], "level": "medium"}
++Context7:   {"query": "...", "context7": true} — also queries library docs
 
 Levels: low(6) · medium(12) · high(24) · crazy(48). Default: medium.`,
 		InputSchema: mcp.JSONSchema{
 			Type: "object",
 			Properties: map[string]mcp.Property{
 				"query":    {Type: "string", Description: "Search terms. Supports site:, filetype:, -term, \"phrase\"."},
-				"queries":  {Type: "array", Description: "Multiple queries for parallel research (2-5)."},
+				"queries":  {Type: "array", Description: "Multiple queries (1-5), run sequentially."},
 				"level":    {Type: "string", Description: "low | medium | high | crazy"},
 				"site":     {Type: "string", Description: "Restrict to domain (e.g. github.com)."},
-				"context7": {Type: "boolean", Description: "Also query Context7 for library docs alongside web search."},
+				"context7": {Type: "boolean", Description: "Also query Context7 for library docs (requires CONTEXT7_API_KEY)."},
 			},
 		},
 	},
@@ -134,7 +129,7 @@ func (a *app) handle(name string, args map[string]any) (string, error) {
 
 func (a *app) webSearch(args map[string]any) (string, error) {
 	if rawQ, ok := args["queries"].([]any); ok && len(rawQ) > 0 {
-		return a.parallelSearch(rawQ, args)
+		return a.multiSearch(rawQ, args)
 	}
 	if _, ok := args["query"]; ok {
 		return a.singleSearch(args)
@@ -175,7 +170,7 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 		return "", err
 	}
 
-	pr := a.fetchPages(t, results, fetchCount, maxPageCharsSingle)
+	pr := a.fetchPages(t, results, fetchCount)
 
 	if ctx7Done != nil {
 		<-ctx7Done
@@ -194,6 +189,8 @@ func (a *app) singleSearch(args map[string]any) (string, error) {
 	}
 	if ctx7Result != nil {
 		out["context7"] = ctx7Result
+	} else if useCtx7 && a.ctx7 == nil {
+		out["context7_note"] = "context7 requested but CONTEXT7_API_KEY is not set — skipped"
 	}
 	return jsonString(out), nil
 }
@@ -207,7 +204,11 @@ func buildSummary(totalURLs, fetched, skipped int) string {
 	return s
 }
 
-// ─── parallel search + auto-fetch ───────────────────────────────
+// ─── multi-query search + auto-fetch ────────────────────────────
+//
+// Queries run one after another (Kimi drives a single active tab per
+// session), each in its own tab within the shared group, with a short
+// randomized delay between them to reduce bot detection.
 
 type querySpec struct {
 	Query string
@@ -216,9 +217,9 @@ type querySpec struct {
 	ID    string
 }
 
-func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, error) {
+func (a *app) multiSearch(rawQueries []any, args map[string]any) (string, error) {
 	if len(rawQueries) > 5 {
-		return "", fmt.Errorf("max 5 parallel queries")
+		return "", fmt.Errorf("max 5 queries")
 	}
 
 	defer a.tc.CloseAll()
@@ -236,13 +237,13 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 			specs = append(specs, querySpec{
 				Query: orDefault(fmt.Sprint(v["query"]), ""),
 				Site:  orDefault(fmt.Sprint(v["site"]), ""),
-				Level: orDefault(fmt.Sprint(v["level"]), defaultLevel),
+				Level: validLevel(fmt.Sprint(v["level"]), defaultLevel),
 				ID:    orDefault(fmt.Sprint(v["id"]), fmt.Sprintf("t%d", i)),
 			})
 		}
 	}
 
-	a.log("parallel: %d threads (default level=%s)", len(specs), defaultLevel)
+	a.log("multi-query: %d threads (default level=%s)", len(specs), defaultLevel)
 
 	type threadResult struct {
 		ID           string              `json:"id"`
@@ -272,14 +273,12 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 			defer func() {
 				if rec := recover(); rec != nil {
 					r.Error = fmt.Sprintf("panic: %v", rec)
-					a.log("parallel: panic in thread %s: %v", spec.ID, rec)
+					a.log("multi-query: panic in thread %s: %v", spec.ID, rec)
 				}
 			}()
 
+			// spec.Level is validated at spec-build time, so this never zeroes.
 			fetchCount := searchLevel[spec.Level]
-			if fetchCount == 0 {
-				fetchCount = searchLevel["medium"]
-			}
 
 			t := a.tc.NewThread(spec.ID)
 			defer a.closeThread(t)
@@ -300,7 +299,7 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 			}
 			r.Results = results
 
-			pages := a.fetchPages(t, results, fetchCount, maxPageCharsParallel)
+			pages := a.fetchPages(t, results, fetchCount)
 			r.Pages = pages.pages
 			r.PagesFetched = len(pages.pages)
 			r.PagesSkipped = pages.skipped
@@ -323,19 +322,23 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 		totalPages += tr.PagesFetched
 		totalSkipped += tr.PagesSkipped
 	}
-	a.log("parallel: %d/%d ok (%d pages)", success, len(all), totalPages)
+	a.log("multi-query: %d/%d ok (%d pages)", success, len(all), totalPages)
 
 	summary := fmt.Sprintf("%d queries · %d ok · %d pages", len(all), success, totalPages)
 	if totalSkipped > 0 {
 		summary += fmt.Sprintf(" (%d skipped)", totalSkipped)
 	}
 
-	return jsonString(map[string]any{
+	out := map[string]any{
 		"threads": all, "total": len(all),
 		"success": success, "total_pages": totalPages,
 		"summary":      summary,
 		"skipped_urls": allSkippedURLs,
-	}), nil
+	}
+	if useCtx7 && a.ctx7 == nil {
+		out["context7_note"] = "context7 requested but CONTEXT7_API_KEY is not set — skipped"
+	}
+	return jsonString(out), nil
 }
 
 // ─── shared: live search with pagination ───────────────────────
@@ -429,7 +432,7 @@ type pageResult struct {
 // fetch tabs gave no real throughput — only extra tab churn and switch races.
 // One query therefore drives exactly one tab. If no pages can be fetched,
 // returns an empty pageResult.
-func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int, maxChars int) pageResult {
+func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int) pageResult {
 	if len(results) == 0 {
 		return pageResult{}
 	}
@@ -442,7 +445,7 @@ func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int
 
 	for i := 0; i < len(results) && len(pages) < fetchCount; i++ {
 		url := results[i].URL
-		page, skipReason := a.fetchOnePage(t, url, maxChars)
+		page, skipReason := a.fetchOnePage(t, url)
 		if page == nil {
 			skipped++
 			skippedURLs = append(skippedURLs, map[string]string{"url": url, "reason": skipReason})
@@ -456,10 +459,10 @@ func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int
 }
 
 // fetchOnePage navigates to url, extracts the main content and returns a
-// populated page map with an empty skip reason on success. It returns nil and a
-// non-empty reason if the page could not be fetched, is an error page, or
-// belongs to a blocked domain.
-func (a *app) fetchOnePage(t *kimi.Thread, url string, maxChars int) (map[string]any, string) {
+// populated page map (full, untruncated markdown) with an empty skip reason on
+// success. It returns nil and a non-empty reason if the page could not be
+// fetched, is an error page, or belongs to a blocked domain.
+func (a *app) fetchOnePage(t *kimi.Thread, url string) (map[string]any, string) {
 	// Blocked domains (video/streaming): skip fetch entirely
 	if google.IsBlockedDomain(url) {
 		a.log("  skip (blocked): %s", truncLog(url, 60))
@@ -487,13 +490,10 @@ func (a *app) fetchOnePage(t *kimi.Thread, url string, maxChars int) (map[string
 		return nil, "error page detected"
 	}
 
-	truncatedMD, origLen, wasTruncated := middleTruncate(content.Markdown, maxChars)
 	return map[string]any{
-		"url":             url,
-		"title":           content.Title,
-		"markdown":        truncatedMD,
-		"truncated":       wasTruncated,
-		"original_length": origLen,
+		"url":      url,
+		"title":    content.Title,
+		"markdown": content.Markdown,
 	}, ""
 }
 
@@ -530,13 +530,10 @@ func (a *app) fetchPage(args map[string]any) (string, error) {
 		return "", fmt.Errorf("error page detected at %s (likely 404, DNS, or challenge)", url)
 	}
 
-	truncatedMD, origLen, wasTruncated := middleTruncate(content.Markdown, maxPageCharsFetch)
-
 	return jsonString(map[string]any{
 		"url": url, "title": content.Title, "byline": content.Byline,
-		"markdown":  truncatedMD,
-		"truncated": wasTruncated, "original_length": origLen,
-		"summary": "1 page fetched (live)",
+		"markdown": content.Markdown,
+		"summary":  "1 page fetched (live)",
 	}), nil
 }
 
@@ -566,9 +563,13 @@ func (a *app) simulateHumanBehavior(t *kimi.Thread) {
 
 func levelArg(args map[string]any, def string) string {
 	raw, _ := args["level"].(string)
-	if raw == "" {
-		return def
-	}
+	return validLevel(raw, def)
+}
+
+// validLevel returns raw if it names a known level, otherwise def. Used by both
+// single and multi-query paths so an unknown level is normalized the same way
+// (and never reported back as if it were honored).
+func validLevel(raw, def string) string {
 	if _, ok := searchLevel[raw]; ok {
 		return raw
 	}
@@ -591,23 +592,8 @@ func jsonString(v any) string {
 	return string(b)
 }
 
-// middleTruncate performs UTF-8 safe middle-truncation: keeps the first ~70%
-// and last ~30% of runes, cutting the middle. Returns truncated content
-// (no embedded message), original rune count, and whether truncation occurred.
-func middleTruncate(s string, maxChars int) (string, int, bool) {
-	runes := []rune(s)
-	originalLen := len(runes)
-	if originalLen <= maxChars {
-		return s, originalLen, false
-	}
-	headLen := maxChars * 70 / 100
-	tailLen := maxChars - headLen
-	result := string(runes[:headLen]) + "\n\n... (content truncated) ...\n\n" + string(runes[originalLen-tailLen:])
-	return result, originalLen, true
-}
-
 // truncLog truncates a string for log display (head-only, byte-level).
-// Used for logging URLs without pulling in the full middleTruncate machinery.
+// Used for logging long URLs in diagnostics, never for returned content.
 func truncLog(s string, n int) string {
 	if len(s) > n {
 		return s[:n]
