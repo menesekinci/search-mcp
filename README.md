@@ -66,7 +66,8 @@ Agent → MCP stdio → search-mcp.exe → Kimi WebBridge → Chrome → Google
 - **Pagination:** auto-paginates Google until target result count is hit
 - **Dedup:** URL-based within a search, same page never fetched twice
 - **Always live:** no cache, no local database — every call hits Google and the target pages fresh. True to the research spirit.
-- **Multi-query:** `queries: [...]` runs each query sequentially in its own Chrome tab (with a short randomized delay between them to avoid bot detection). Within a single query, the top results are fetched concurrently (up to 3 at a time).
+- **Single tab per query:** each query drives exactly one Chrome tab — it searches there, then navigates that same tab through each result page in turn. Kimi serves one active tab per session and serializes browser commands, so sequential reuse is as fast as juggling multiple tabs, with less churn.
+- **Multi-query:** `queries: [...]` runs each query one after another (with a short randomized delay between them to avoid bot detection), each in its own tab within the shared group.
 
 ## 📦 Tools
 

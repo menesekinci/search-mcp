@@ -6,7 +6,6 @@ import (
 	"math/rand"
 	"os"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/menesekinci/search-mcp/internal/context7"
@@ -422,66 +421,35 @@ type pageResult struct {
 }
 
 // fetchPages auto-fetches search results as markdown until fetchCount pages
-// succeed. Results are processed in concurrent batches of maxConcurrent (each
-// goroutine gets its own tab and closes it on completion); after each batch
-// the successes are counted and fetching stops as soon as the target is met.
-// This way broken pages are skipped without eagerly fetching a large fixed
-// buffer of extra results that would just be discarded. If no pages can be
-// fetched, returns an empty pageResult.
+// succeed, walking results in order and skipping broken/blocked/error pages.
+//
+// Fetching is sequential and reuses the search thread's own tab: Kimi serves
+// one active tab per session and serializes every browser command behind a
+// single lock, and Navigate blocks until the page is ready, so concurrent
+// fetch tabs gave no real throughput — only extra tab churn and switch races.
+// One query therefore drives exactly one tab. If no pages can be fetched,
+// returns an empty pageResult.
 func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int, maxChars int) pageResult {
 	if len(results) == 0 {
 		return pageResult{}
 	}
 
-	a.log("auto-fetch: up to %d pages [%s] (parallel, max 3 concurrent, staged)", fetchCount, t.Name())
-
-	const maxConcurrent = 3
-
-	type fetchResult struct {
-		page       map[string]any
-		skipReason string
-	}
+	a.log("auto-fetch: up to %d pages [%s] (sequential, single tab)", fetchCount, t.Name())
 
 	pages := make([]map[string]any, 0, fetchCount)
 	var skipped int
 	var skippedURLs []map[string]string
 
-	// Walk results in batches, stopping once fetchCount pages succeed. At most
-	// maxConcurrent-1 results beyond the last needed one are fetched (the tail
-	// of the final batch).
-	for next := 0; next < len(results) && len(pages) < fetchCount; {
-		batch := maxConcurrent
-		if remaining := len(results) - next; remaining < batch {
-			batch = remaining
+	for i := 0; i < len(results) && len(pages) < fetchCount; i++ {
+		url := results[i].URL
+		page, skipReason := a.fetchOnePage(t, url, maxChars)
+		if page == nil {
+			skipped++
+			skippedURLs = append(skippedURLs, map[string]string{"url": url, "reason": skipReason})
+			a.log("  skip: %s", truncLog(url, 60))
+			continue
 		}
-
-		batchRes := make([]fetchResult, batch)
-		var wg sync.WaitGroup
-		for j := 0; j < batch; j++ {
-			wg.Add(1)
-			go func(slot, idx int) {
-				defer wg.Done()
-				ft := a.tc.NewThread(fmt.Sprintf("%s-fetch-%d", t.Name(), idx))
-				defer a.closeThread(ft)
-
-				page, skipReason := a.fetchOnePage(ft, results[idx].URL, maxChars)
-				batchRes[slot] = fetchResult{page: page, skipReason: skipReason}
-			}(j, next+j)
-		}
-		wg.Wait()
-
-		for j := 0; j < batch && len(pages) < fetchCount; j++ {
-			fr := batchRes[j]
-			url := results[next+j].URL
-			if fr.page == nil {
-				skipped++
-				skippedURLs = append(skippedURLs, map[string]string{"url": url, "reason": fr.skipReason})
-				a.log("  skip: %s", truncLog(url, 60))
-				continue
-			}
-			pages = append(pages, fr.page)
-		}
-		next += batch
+		pages = append(pages, page)
 	}
 
 	return pageResult{pages: pages, skipped: skipped, skippedURLs: skippedURLs}
