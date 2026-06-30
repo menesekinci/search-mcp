@@ -75,12 +75,13 @@ Agent → MCP stdio → search-mcp.exe → Kimi WebBridge → Chrome → Google
 |------|-------------|
 | `web_search` | Search + auto-fetch. One call = everything. |
 | `fetch_page` | Fetch specific URL (user pastes a link). |
+| `start_kimi` | Start the Kimi WebBridge daemon if it isn't running (call when searches fail with "daemon unreachable"). |
 
 ## 🛠️ CLI
 
 ```bash
 search-mcp setup       # Interactive setup wizard
-search-mcp --version   # v0.7.0
+search-mcp --version   # v0.8.0
 search-mcp             # MCP server (stdio mode)
 ```
 

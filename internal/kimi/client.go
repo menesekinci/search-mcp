@@ -74,7 +74,8 @@ func (c *Client) do(action string, args map[string]any, v any) error {
 
 	resp, err := c.http.Do(req)
 	if err != nil {
-		return fmt.Errorf("kimi: do: %w", err)
+		// Almost always means the WebBridge daemon is not running.
+		return fmt.Errorf("kimi: WebBridge daemon unreachable at %s — run the start_kimi tool or launch Kimi Desktop, and make sure the Chrome extension shows Ready (%w)", BaseURL, err)
 	}
 	defer resp.Body.Close()
 

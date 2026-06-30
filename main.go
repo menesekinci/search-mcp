@@ -18,7 +18,7 @@ import (
 
 // ─── Configuration ──────────────────────────────────────────────
 
-const Version = "v0.7.0"
+const Version = "v0.8.0"
 
 var searchLevel = map[string]int{
 	"low": 6, "medium": 12, "high": 24, "crazy": 48,
@@ -61,6 +61,17 @@ Use for direct links. Not needed after web_search (it auto-fetches). Always live
 				"url": {Type: "string", Description: "Page URL."},
 			},
 			Required: []string{"url"},
+		},
+	},
+	{
+		Name: "start_kimi",
+		Description: `Check the Kimi WebBridge browser daemon and start it if it is not running.
+search-mcp drives Chrome through this daemon (127.0.0.1:10086). If web_search or
+fetch_page fail because the daemon is unreachable, call this first, then retry.
+After it reports "running"/"started", make sure the Chrome extension shows Ready.`,
+		InputSchema: mcp.JSONSchema{
+			Type:       "object",
+			Properties: map[string]mcp.Property{},
 		},
 	},
 }
@@ -120,9 +131,41 @@ func (a *app) handle(name string, args map[string]any) (string, error) {
 		return a.webSearch(args)
 	case "fetch_page":
 		return a.fetchPage(args)
+	case "start_kimi":
+		return a.startKimi(args)
 	default:
 		return "", fmt.Errorf("unknown tool: %s", name)
 	}
+}
+
+// ─── start_kimi (ensure the WebBridge daemon is running) ────────
+
+func (a *app) startKimi(args map[string]any) (string, error) {
+	if kimi.IsBridgeUp(500 * time.Millisecond) {
+		a.log("start_kimi: daemon already up")
+		return jsonString(map[string]any{
+			"status":  "running",
+			"summary": "Kimi WebBridge daemon is already running (127.0.0.1:10086).",
+		}), nil
+	}
+
+	a.log("start_kimi: daemon down, attempting to launch")
+	path, err := kimi.StartBridge(15 * time.Second)
+	if err != nil {
+		a.log("start_kimi: %v", err)
+		return jsonString(map[string]any{
+			"status":      "error",
+			"daemon_path": path,
+			"summary":     err.Error(),
+		}), nil
+	}
+
+	a.log("start_kimi: daemon up (%s)", path)
+	return jsonString(map[string]any{
+		"status":      "started",
+		"daemon_path": path,
+		"summary":     "Kimi WebBridge daemon started and is now accepting connections. Make sure the Chrome extension shows 'Ready', then retry your search.",
+	}), nil
 }
 
 // ─── web_search (dispatcher: single vs parallel) ────────────────
