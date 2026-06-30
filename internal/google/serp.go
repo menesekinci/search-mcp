@@ -2,6 +2,7 @@ package google
 
 import (
 	"fmt"
+	"net/url"
 	"os"
 	"strings"
 
@@ -224,9 +225,39 @@ func cleanURL(raw string) string {
 	if raw == "" {
 		return ""
 	}
-	// Strip Google redirect wrapper
-	// Sometimes Google wraps URLs, but modern SERP gives clean URLs directly via zReHs
-	return strings.TrimSpace(raw)
+	raw = strings.TrimSpace(raw)
+	// Unwrap Google redirect wrappers (/url?q=<real>&... or
+	// https://www.google.com/url?q=...). Modern SERP usually gives clean URLs
+	// via zReHs, but older layouts and some link slots still wrap them.
+	if strings.HasPrefix(raw, "/url?") || strings.Contains(raw, "google.com/url?") {
+		if u, err := url.Parse(raw); err == nil {
+			if q := u.Query().Get("q"); q != "" {
+				return q
+			}
+		}
+	}
+	return raw
+}
+
+// IsBlockedDomain reports whether rawURL's host is a blocked video/streaming
+// domain or a subdomain of one. Matching on the parsed host (not a raw
+// substring) avoids false positives like a blocked name appearing in a path
+// or query parameter.
+func IsBlockedDomain(rawURL string) bool {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if host == "" {
+		return false
+	}
+	for _, d := range BlockedDomains {
+		if host == d || strings.HasSuffix(host, "."+d) {
+			return true
+		}
+	}
+	return false
 }
 
 // SearchURL builds a Google search URL with the given query and options.

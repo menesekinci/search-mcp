@@ -44,10 +44,10 @@ search-mcp setup
 
 | Level | Results | Use case |
 |-------|---------|----------|
-| `low` | 3 | Quick fact check |
-| `medium` | 6 | Normal research (default) |
-| `high` | 12 | Deep literature scan |
-| `crazy` | 24 | Exhaustive discovery |
+| `low` | 6 | Quick fact check |
+| `medium` | 12 | Normal research (default) |
+| `high` | 24 | Deep literature scan |
+| `crazy` | 48 | Exhaustive discovery |
 
 ```json
 {"query": "rust async patterns", "level": "high", "site": "docs.rs"}
@@ -65,8 +65,8 @@ Agent → MCP stdio → search-mcp.exe → Kimi WebBridge → Chrome → Google
 
 - **Pagination:** auto-paginates Google until target result count is hit
 - **Dedup:** URL-based, same page never fetched twice
-- **Cache:** SQLite at `~/.search-mcp/cache.db`, permanent, no expiry
-- **Parallel:** `queries: [...]` → multiple Chrome tabs in same group
+- **Cache:** SQLite at `~/.search-mcp/cache.db`. Entries are served for 7 days by default (`max_age_days` overrides per call; `0` forces a live fetch). Rows are garbage-collected after 30 days, and an expired row is still used as a stale fallback if a live fetch fails.
+- **Multi-query:** `queries: [...]` runs each query sequentially in its own Chrome tab (with a short randomized delay between them to avoid bot detection). Within a single query, the top results are fetched concurrently (up to 3 at a time).
 
 ## 📦 Tools
 
@@ -79,7 +79,7 @@ Agent → MCP stdio → search-mcp.exe → Kimi WebBridge → Chrome → Google
 
 ```bash
 search-mcp setup       # Interactive setup wizard
-search-mcp --version   # v0.5.1
+search-mcp --version   # v0.5.3
 search-mcp             # MCP server (stdio mode)
 ```
 

@@ -348,6 +348,47 @@ func canaryFixture() string {
 </html>`
 }
 
+func TestCleanURL_UnwrapsGoogleRedirect(t *testing.T) {
+	cases := map[string]string{
+		"/url?q=https://example.com/page&sa=U":                 "https://example.com/page",
+		"https://www.google.com/url?q=https://foo.dev/x&ved=1": "https://foo.dev/x",
+		"https://example.com/direct":                           "https://example.com/direct",
+		"  https://example.com/trimmed  ":                      "https://example.com/trimmed",
+		"":                                                     "",
+	}
+	for in, want := range cases {
+		if got := cleanURL(in); got != want {
+			t.Errorf("cleanURL(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+func TestIsBlockedDomain(t *testing.T) {
+	blocked := []string{
+		"https://www.youtube.com/watch?v=abc",
+		"https://youtu.be/abc",
+		"http://m.tiktok.com/@user",
+		"https://player.vimeo.com/video/123",
+	}
+	for _, u := range blocked {
+		if !IsBlockedDomain(u) {
+			t.Errorf("IsBlockedDomain(%q) = false, want true", u)
+		}
+	}
+
+	allowed := []string{
+		"https://example.com/page?ref=youtube.com", // blocked name only in query
+		"https://notyoutube.com/x",                 // not a subdomain
+		"https://myvimeo.company.com/post",         // not a subdomain of vimeo.com
+		"https://github.com/golang/go",
+	}
+	for _, u := range allowed {
+		if IsBlockedDomain(u) {
+			t.Errorf("IsBlockedDomain(%q) = true, want false", u)
+		}
+	}
+}
+
 func TestSearchURL(t *testing.T) {
 	u := SearchURL("golang web scraping", "", 5)
 	if !strings.Contains(u, "golang+web+scraping") {

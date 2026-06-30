@@ -32,6 +32,13 @@ const (
 	maxPageCharsFetch    = 30000 // per-page markdown in fetch_page (standalone)
 )
 
+// cacheRetentionDays bounds how long cache rows survive on disk. It is the
+// startup garbage-collection window, kept well above the 7-day default
+// freshness TTL so that (a) callers passing a longer max_age_days still get
+// hits and (b) expired-but-recent rows remain available for stale fallback
+// when a live fetch fails.
+const cacheRetentionDays = 30
+
 // ─── MCP tool definitions ───────────────────────────────────────
 
 var tools = []mcp.Tool{
@@ -117,9 +124,9 @@ func main() {
 	sCount, pCount, _ := db.Stats()
 	logf("cache: %d searches, %d pages", sCount, pCount)
 
-	sp, pp, _ := db.PurgeExpired(7)
+	sp, pp, _ := db.PurgeExpired(cacheRetentionDays)
 	if sp+pp > 0 {
-		logf("purged: %d searches, %d pages (older than 7 days)", sp, pp)
+		logf("purged: %d searches, %d pages (older than %d days)", sp, pp, cacheRetentionDays)
 	}
 
 	app := &app{
@@ -410,11 +417,17 @@ func (a *app) parallelSearch(rawQueries []any, args map[string]any) (string, err
 func (a *app) doSearch(query, site string, num int, maxAgeDays int, t *kimi.Thread) ([]google.Result, bool, error) {
 	if maxAgeDays != 0 {
 		if cached, err := a.db.GetSearch(query, site, maxAgeDays); err == nil && cached != nil {
-			if len(cached.Results) > num {
+			// Only serve from cache when it holds at least as many results as
+			// requested. A later, higher level (e.g. low→high) asks for more
+			// than an earlier search stored, so fall through to a live search
+			// that re-paginates and upserts the larger result set.
+			if len(cached.Results) >= num {
 				cached.Results = cached.Results[:num]
+				a.log("cache HIT [%s]: %q (%d results)", t.Name(), query, len(cached.Results))
+				return cached.Results, true, nil
 			}
-			a.log("cache HIT [%s]: %q (%d results)", t.Name(), query, len(cached.Results))
-			return cached.Results, true, nil
+			a.log("cache PARTIAL [%s]: %q (%d cached < %d requested) — refetching",
+				t.Name(), query, len(cached.Results), num)
 		}
 	}
 
@@ -499,83 +512,75 @@ type pageResult struct {
 	skippedURLs []map[string]string // [{url, reason}]
 }
 
-// fetchPages auto-fetches the top N search results as markdown in parallel.
-// Uses a channel-based semaphore (max 3 concurrent) to limit live fetches.
-// Each parallel goroutine gets its own tab and closes it on completion.
-// Broken pages are skipped and the next result is tried, up to fetchCount
-// total successes. If no pages can be fetched, returns an empty pageResult.
+// fetchPages auto-fetches search results as markdown until fetchCount pages
+// succeed. Results are processed in concurrent batches of maxConcurrent (each
+// goroutine gets its own tab and closes it on completion); after each batch
+// the successes are counted and fetching stops as soon as the target is met.
+// This way broken pages are skipped without eagerly fetching a large fixed
+// buffer of extra results that would just be discarded. If no pages can be
+// fetched, returns an empty pageResult.
 func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int, maxChars int, maxAgeDays int) pageResult {
 	if len(results) == 0 {
 		return pageResult{}
 	}
 
-	a.log("auto-fetch: up to %d pages [%s] (parallel, max 3 concurrent)", fetchCount, t.Name())
-
-	// Launch goroutines for fetchCount+10 results (buffer for skips)
-	numToFetch := len(results)
-	if numToFetch > fetchCount+10 {
-		numToFetch = fetchCount + 10
-	}
+	a.log("auto-fetch: up to %d pages [%s] (parallel, max 3 concurrent, staged)", fetchCount, t.Name())
 
 	const maxConcurrent = 3
-	sem := make(chan struct{}, maxConcurrent)
 
 	type fetchResult struct {
-		index      int
 		page       map[string]any
 		skipReason string
 		fromCache  bool
 	}
 
-	resultCh := make(chan fetchResult, numToFetch)
-	var wg sync.WaitGroup
-
-	for i := 0; i < numToFetch; i++ {
-		wg.Add(1)
-		go func(idx int, url string) {
-			defer wg.Done()
-			sem <- struct{}{}        // acquire
-			defer func() { <-sem }() // release
-
-			ft := a.tc.NewThread(fmt.Sprintf("%s-fetch-%d", t.Name(), idx))
-			defer a.closeThread(ft)
-
-			page, skipReason := a.fetchOnePage(ft, url, maxChars, maxAgeDays)
-			resultCh <- fetchResult{
-				index:      idx,
-				page:       page,
-				skipReason: skipReason,
-				fromCache:  page != nil && page["from_cache"] == true,
-			}
-		}(i, results[i].URL)
-	}
-
-	go func() { wg.Wait(); close(resultCh) }()
-
-	// Collect results into index-ordered slice
-	fetched := make([]fetchResult, numToFetch)
-	for fr := range resultCh {
-		fetched[fr.index] = fr
-	}
-
-	// Build output, respecting fetchCount limit
 	pages := make([]map[string]any, 0, fetchCount)
 	var cached, skipped int
 	var skippedURLs []map[string]string
 
-	for i := 0; i < numToFetch && len(pages) < fetchCount; i++ {
-		fr := fetched[i]
-		url := results[i].URL
-		if fr.page == nil {
-			skipped++
-			skippedURLs = append(skippedURLs, map[string]string{"url": url, "reason": fr.skipReason})
-			a.log("  skip: %s", truncLog(url, 60))
-			continue
+	// Walk results in batches, stopping once fetchCount pages succeed. At most
+	// maxConcurrent-1 results beyond the last needed one are fetched (the tail
+	// of the final batch), versus the previous fixed fetchCount+10 buffer.
+	for next := 0; next < len(results) && len(pages) < fetchCount; {
+		batch := maxConcurrent
+		if remaining := len(results) - next; remaining < batch {
+			batch = remaining
 		}
-		if fr.fromCache {
-			cached++
+
+		batchRes := make([]fetchResult, batch)
+		var wg sync.WaitGroup
+		for j := 0; j < batch; j++ {
+			wg.Add(1)
+			go func(slot, idx int) {
+				defer wg.Done()
+				ft := a.tc.NewThread(fmt.Sprintf("%s-fetch-%d", t.Name(), idx))
+				defer a.closeThread(ft)
+
+				page, skipReason := a.fetchOnePage(ft, results[idx].URL, maxChars, maxAgeDays)
+				batchRes[slot] = fetchResult{
+					page:       page,
+					skipReason: skipReason,
+					fromCache:  page != nil && page["from_cache"] == true,
+				}
+			}(j, next+j)
 		}
-		pages = append(pages, fr.page)
+		wg.Wait()
+
+		for j := 0; j < batch && len(pages) < fetchCount; j++ {
+			fr := batchRes[j]
+			url := results[next+j].URL
+			if fr.page == nil {
+				skipped++
+				skippedURLs = append(skippedURLs, map[string]string{"url": url, "reason": fr.skipReason})
+				a.log("  skip: %s", truncLog(url, 60))
+				continue
+			}
+			if fr.fromCache {
+				cached++
+			}
+			pages = append(pages, fr.page)
+		}
+		next += batch
 	}
 
 	return pageResult{pages: pages, cached: cached, skipped: skipped, skippedURLs: skippedURLs}
@@ -586,11 +591,9 @@ func (a *app) fetchPages(t *kimi.Thread, results []google.Result, fetchCount int
 // page, or belongs to a blocked domain.
 func (a *app) fetchOnePage(t *kimi.Thread, url string, maxChars int, maxAgeDays int) (map[string]any, string) {
 	// Blocked domains (video/streaming): skip fetch entirely
-	for _, domain := range google.BlockedDomains {
-		if strings.Contains(url, domain) {
-			a.log("  skip (blocked): %s", truncLog(url, 60))
-			return nil, "blocked domain"
-		}
+	if google.IsBlockedDomain(url) {
+		a.log("  skip (blocked): %s", truncLog(url, 60))
+		return nil, "blocked domain"
 	}
 
 	page := map[string]any{"url": url}
@@ -868,30 +871,23 @@ func truncLog(s string, n int) string {
 	return s
 }
 
-// errorPagePatterns are substrings (case-insensitive) that mark a fetched
-// page as a browser/network error rather than real content. Matched against
-// the extracted markdown so a DNS error page or Cloudflare challenge does
-// not pollute the LLM's context.
-var errorPagePatterns = []string{
+// strongErrorPatterns are substrings (case-insensitive) that almost never
+// appear in legitimate article content — a match alone marks the page as a
+// browser/network error. Matched against the start of the extracted markdown
+// so a DNS error page or Cloudflare challenge does not pollute the LLM's
+// context.
+var strongErrorPatterns = []string{
 	"dns_probe_finished",
 	"nxdomain",
 	"this site can't be reached",
 	"siteye ulaşılamıyor",
-	"404 not found",
 	"http error 404",
 	"http error 5",
 	"sayfa bulunamıyor",
-	"sayfa bulunamadı",
-	"page not found",
-	"access denied",
-	"forbidden",
 	"just a moment",   // Cloudflare interstitial
 	"checking your browser",
-	"captcha",
 	"you have been blocked",
 	"attention required",
-	"rate limit",
-	"too many requests",
 	"err_ssl",
 	"err_connection",
 	"hata kodu",
@@ -899,6 +895,26 @@ var errorPagePatterns = []string{
 	"connection timed out",
 	"this webpage is not available",
 }
+
+// weakErrorPatterns are phrases that also occur in legitimate technical
+// content (security docs, HTTP guides, API references). They only mark an
+// error page when the page as a whole is very short — real error pages carry
+// little body text, whereas an article about "rate limiting" or "HTTP 404"
+// has plenty.
+var weakErrorPatterns = []string{
+	"404 not found",
+	"page not found",
+	"sayfa bulunamadı",
+	"access denied",
+	"forbidden",
+	"captcha",
+	"rate limit",
+	"too many requests",
+}
+
+// errorPageShortLen is the rune threshold below which weak patterns are
+// trusted. Genuine error pages produce far less markdown than real articles.
+const errorPageShortLen = 600
 
 // isErrorPage reports whether the given markdown looks like a browser
 // error page (DNS, 404, Cloudflare challenge, etc.) rather than real content.
@@ -912,9 +928,18 @@ func isErrorPage(markdown string) bool {
 	if len(head) > 2048 {
 		head = head[:2048]
 	}
-	for _, pat := range errorPagePatterns {
+	for _, pat := range strongErrorPatterns {
 		if strings.Contains(head, pat) {
 			return true
+		}
+	}
+	// Weak patterns are common words in legitimate content, so only treat them
+	// as error markers when the whole page is very short.
+	if len([]rune(markdown)) < errorPageShortLen {
+		for _, pat := range weakErrorPatterns {
+			if strings.Contains(head, pat) {
+				return true
+			}
 		}
 	}
 	return false
